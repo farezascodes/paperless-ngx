@@ -1,9 +1,10 @@
-import grp
+import logging
 import os
-import pwd
 import shutil
 import stat
+import subprocess
 from pathlib import Path
+from typing import Any
 
 from django.conf import settings
 from django.core.checks import Error
@@ -21,7 +22,7 @@ writeable_hint = (
 )
 
 
-def path_check(var, directory: Path) -> list[Error]:
+def path_check(var: str, directory: Path) -> list[Error]:
     messages: list[Error] = []
     if directory:
         if not directory.is_dir():
@@ -36,8 +37,8 @@ def path_check(var, directory: Path) -> list[Error]:
             except PermissionError:
                 dir_stat: os.stat_result = Path(directory).stat()
                 dir_mode: str = stat.filemode(dir_stat.st_mode)
-                dir_owner: str = pwd.getpwuid(dir_stat.st_uid).pw_name
-                dir_group: str = grp.getgrgid(dir_stat.st_gid).gr_name
+                dir_owner: str = ""
+                dir_group: str = ""
                 messages.append(
                     Error(
                         writeable_message.format(var),
@@ -58,7 +59,7 @@ def path_check(var, directory: Path) -> list[Error]:
 
 
 @register()
-def paths_check(app_configs, **kwargs) -> list[Error]:
+def paths_check(app_configs: Any, **kwargs: Any) -> list[Error]:
     """
     Check the various paths for existence, readability and writeability
     """
@@ -72,7 +73,7 @@ def paths_check(app_configs, **kwargs) -> list[Error]:
 
 
 @register()
-def binaries_check(app_configs, **kwargs):
+def binaries_check(app_configs: Any, **kwargs: Any) -> list[Error]:
     """
     Paperless requires the existence of a few binaries, so we do some checks
     for those here.
@@ -92,7 +93,7 @@ def binaries_check(app_configs, **kwargs):
 
 
 @register()
-def debug_mode_check(app_configs, **kwargs):
+def debug_mode_check(app_configs: Any, **kwargs: Any) -> list[Warning]:
     if settings.DEBUG:
         return [
             Warning(
@@ -108,7 +109,7 @@ def debug_mode_check(app_configs, **kwargs):
 
 
 @register()
-def settings_values_check(app_configs, **kwargs):
+def settings_values_check(app_configs: Any, **kwargs: Any) -> list[Error | Warning]:
     """
     Validates at least some of the user provided settings
     """
@@ -131,23 +132,14 @@ def settings_values_check(app_configs, **kwargs):
                 Error(f'OCR output type "{settings.OCR_OUTPUT_TYPE}" is not valid'),
             )
 
-        if settings.OCR_MODE not in {"force", "skip", "redo", "skip_noarchive"}:
+        if settings.OCR_MODE not in {"auto", "force", "redo", "off"}:
             msgs.append(Error(f'OCR output mode "{settings.OCR_MODE}" is not valid'))
 
-        if settings.OCR_MODE == "skip_noarchive":
-            msgs.append(
-                Warning(
-                    'OCR output mode "skip_noarchive" is deprecated and will be '
-                    "removed in a future version. Please use "
-                    "PAPERLESS_OCR_SKIP_ARCHIVE_FILE instead.",
-                ),
-            )
-
-        if settings.OCR_SKIP_ARCHIVE_FILE not in {"never", "with_text", "always"}:
+        if settings.ARCHIVE_FILE_GENERATION not in {"auto", "always", "never"}:
             msgs.append(
                 Error(
-                    "OCR_SKIP_ARCHIVE_FILE setting "
-                    f'"{settings.OCR_SKIP_ARCHIVE_FILE}" is not valid',
+                    "PAPERLESS_ARCHIVE_FILE_GENERATION setting "
+                    f'"{settings.ARCHIVE_FILE_GENERATION}" is not valid',
                 ),
             )
 
@@ -190,7 +182,7 @@ def settings_values_check(app_configs, **kwargs):
 
 
 @register()
-def audit_log_check(app_configs, **kwargs):
+def audit_log_check(app_configs: Any, **kwargs: Any) -> list[Error]:
     db_conn = connections["default"]
     all_tables = db_conn.introspection.table_names()
     result = []
@@ -211,10 +203,10 @@ def check_v3_minimum_upgrade_version(
     **kwargs: object,
 ) -> list[Error]:
     """
-    Enforce that upgrades to v3 must start from v2.20.10.
+    Enforce that upgrades to v3 must start from v2.20.15.
 
     v3 squashes all prior migrations into 0001_squashed and 0002_squashed.
-    If a user skips v2.20.10, the data migration in 1075_workflowaction_order
+    If a user skips v2.20.15, the data migration in 1075_workflowaction_order
     never runs and the squash may apply schema changes against an incomplete
     database state.
     """
@@ -241,19 +233,28 @@ def check_v3_minimum_upgrade_version(
         if {"0001_squashed", "0002_squashed"} & applied:
             return []
 
-        # On v2.20.10 exactly — squash will pick up cleanly from here
+        # On v2.20.15 exactly — squash will pick up cleanly from here
         if "1075_workflowaction_order" in applied:
             return []
 
     except (DatabaseError, OperationalError):
         return []
 
+    logger = logging.getLogger(__name__)
+    last_applied = sorted(applied)[-1] if applied else "(none)"
+    logger.error(
+        "V3 upgrade check failed: last applied documents migration is %r. "
+        "Expected '1075_workflowaction_order' (v2.20.15). "
+        "Ensure you have upgraded to v2.20.15 and run 'manage.py migrate' before upgrading to v3.",
+        last_applied,
+    )
+
     return [
         Error(
             "Cannot upgrade to Paperless-ngx v3 from this version.",
             hint=(
-                "Upgrading to v3 can only be performed from v2.20.10."
-                "Please upgrade to v2.20.10, run migrations, then upgrade to v3."
+                "Upgrading to v3 can only be performed from v2.20.15. "
+                "Please upgrade to v2.20.15, run migrations, then upgrade to v3. "
                 "See https://docs.paperless-ngx.com/setup/#upgrading for details."
             ),
             id="paperless.E002",
@@ -292,10 +293,104 @@ def check_deprecated_db_settings(
                     f"{var_name} is no longer supported and will be removed in v3.2. "
                     f"Set the equivalent option via PAPERLESS_DB_OPTIONS instead. "
                     f'Example: PAPERLESS_DB_OPTIONS=\'{{"{db_option_key}": "<value>"}}\'. '
-                    "See https://docs.paperless-ngx.com/migration/ for the full reference."
+                    "See https://docs.paperless-ngx.com/migration-v3/ for the full reference."
                 ),
                 id="paperless.W001",
             ),
         )
 
     return warnings
+
+
+@register()
+def check_deprecated_v2_ocr_env_vars(
+    app_configs: object,
+    **kwargs: object,
+) -> list[Warning]:
+    """Warn when deprecated v2 OCR environment variables are set.
+
+    Users upgrading from v2 may still have these in their environment or
+    config files, where they are now silently ignored.
+    """
+    warnings: list[Warning] = []
+
+    if os.environ.get("PAPERLESS_OCR_SKIP_ARCHIVE_FILE"):
+        warnings.append(
+            Warning(
+                "PAPERLESS_OCR_SKIP_ARCHIVE_FILE is set but has no effect. "
+                "Use PAPERLESS_ARCHIVE_FILE_GENERATION=never/always/auto instead.",
+                id="paperless.W002",
+            ),
+        )
+
+    ocr_mode = os.environ.get("PAPERLESS_OCR_MODE", "")
+    if ocr_mode in {"skip", "skip_noarchive"}:
+        warnings.append(
+            Warning(
+                f"PAPERLESS_OCR_MODE={ocr_mode!r} is not a valid value. "
+                f"Use PAPERLESS_OCR_MODE=auto (and PAPERLESS_ARCHIVE_FILE_GENERATION=never "
+                f"if you used skip_noarchive) instead.",
+                id="paperless.W003",
+            ),
+        )
+
+    return warnings
+
+
+@register()
+def check_remote_parser_configured(app_configs: Any, **kwargs: Any) -> list[Error]:
+    if settings.REMOTE_OCR_ENGINE == "azureai" and not (
+        settings.REMOTE_OCR_ENDPOINT and settings.REMOTE_OCR_API_KEY
+    ):
+        return [
+            Error(
+                "Azure AI remote parser requires endpoint and API key to be configured.",
+            ),
+        ]
+
+    return []
+
+
+def get_tesseract_langs():
+    proc = subprocess.run(
+        [shutil.which("tesseract"), "--list-langs"],
+        capture_output=True,
+    )
+
+    # Decode bytes to string, split on newlines, trim out the header
+    proc_lines = proc.stdout.decode("utf8", errors="ignore").strip().split("\n")[1:]
+
+    return [x.strip() for x in proc_lines]
+
+
+@register()
+def check_default_language_available(app_configs: Any, **kwargs: Any) -> list[Error]:
+    errs = []
+
+    if not settings.OCR_LANGUAGE:
+        errs.append(
+            Warning(
+                "No OCR language has been specified with PAPERLESS_OCR_LANGUAGE. "
+                "This means that tesseract will fallback to english.",
+            ),
+        )
+        return errs
+
+    # binaries_check in paperless will check and report if this doesn't exist
+    # So skip trying to do anything here and let that handle missing binaries
+    if shutil.which("tesseract") is not None:
+        installed_langs = get_tesseract_langs()
+
+        specified_langs = [x.strip() for x in settings.OCR_LANGUAGE.split("+")]
+
+        for lang in specified_langs:
+            if lang not in installed_langs:
+                errs.append(
+                    Error(
+                        f"The selected ocr language {lang} is "
+                        f"not installed. Paperless cannot OCR your documents "
+                        f"without it. Please fix PAPERLESS_OCR_LANGUAGE.",
+                    ),
+                )
+
+    return errs

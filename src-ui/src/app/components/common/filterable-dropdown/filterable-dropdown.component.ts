@@ -12,17 +12,22 @@ import {
   Output,
   ViewChild,
   inject,
+  signal,
 } from '@angular/core'
 import { FormsModule, ReactiveFormsModule } from '@angular/forms'
-import { NgbDropdown, NgbDropdownModule } from '@ng-bootstrap/ng-bootstrap'
+import {
+  NgbDropdown,
+  NgbDropdownModule,
+  NgbModalRef,
+} from '@ng-bootstrap/ng-bootstrap'
 import { NgxBootstrapIconsModule } from 'ngx-bootstrap-icons'
-import { Subject, filter, takeUntil } from 'rxjs'
+import { Subject, filter, first, merge, takeUntil } from 'rxjs'
 import { NEGATIVE_NULL_FILTER_VALUE } from 'src/app/data/filter-rule-type'
 import { MatchingModel } from 'src/app/data/matching-model'
 import { ObjectWithPermissions } from 'src/app/data/object-with-permissions'
+import { SelectionDataItem } from 'src/app/data/results'
 import { FilterPipe } from 'src/app/pipes/filter.pipe'
 import { HotKeyService } from 'src/app/services/hot-key.service'
-import { SelectionDataItem } from 'src/app/services/rest/document.service'
 import { pngxPopperOptions } from 'src/app/utils/popper-options'
 import { LoadingComponentWithPermissions } from '../../loading-component/loading.component'
 import { ClearableBadgeComponent } from '../clearable-badge/clearable-badge.component'
@@ -660,7 +665,6 @@ export class FilterableDropdownSelectionModel {
   imports: [
     ClearableBadgeComponent,
     ToggleableDropdownButtonComponent,
-    FilterPipe,
     FormsModule,
     ReactiveFormsModule,
     NgxBootstrapIconsModule,
@@ -759,7 +763,7 @@ export class FilterableDropdownComponent
   disabled = false
 
   @Input()
-  createRef: (name) => void
+  createRef: (name: string) => NgbModalRef
 
   @Input()
   set documentCounts(counts: SelectionDataItem[]) {
@@ -774,7 +778,10 @@ export class FilterableDropdownComponent
   @Input()
   extraButtonTitle: string
 
-  creating: boolean = false
+  @Input()
+  showExtraButtonIfEmpty: boolean = false
+
+  readonly creating = signal(false)
 
   @Output()
   apply = new EventEmitter<ChangedItems>()
@@ -796,22 +803,27 @@ export class FilterableDropdownComponent
     return this.title ? this.title.replace(/\s/g, '_').toLowerCase() : null
   }
 
-  modelIsDirty: boolean = false
+  readonly modelIsDirty = signal(false)
 
   private keyboardIndex: number
 
+  public get filteredItems(): MatchingModel[] {
+    return this.filterPipe
+      .transform(this.items, this.filterText, 'name')
+      .filter((item) => this.allowSelectNone || Boolean(item.id))
+  }
+
   public get scrollViewportHeight(): number {
-    const filteredLength = this.filterPipe.transform(
-      this.items,
-      this.filterText
-    ).length
-    return Math.min(filteredLength * this.FILTERABLE_BUTTON_HEIGHT_PX, 400)
+    return Math.min(
+      this.filteredItems.length * this.FILTERABLE_BUTTON_HEIGHT_PX,
+      400
+    )
   }
 
   constructor() {
     super()
     this.selectionModelChange.subscribe((updatedModel) => {
-      this.modelIsDirty = updatedModel.isDirty()
+      this.modelIsDirty.set(updatedModel.isDirty())
     })
   }
 
@@ -846,27 +858,32 @@ export class FilterableDropdownComponent
   }
 
   createClicked() {
-    this.creating = true
-    this.createRef(this.filterText)
+    this.creating.set(true)
+    const modal = this.createRef(this.filterText)
+    merge(modal.closed, modal.dismissed)
+      .pipe(first(), takeUntil(this.unsubscribeNotifier))
+      .subscribe(() => this.creating.set(false))
   }
 
   dropdownOpenChange(open: boolean): void {
     if (open) {
+      // Dont let a create modal close this
+      if (this.creating()) return
+
       setTimeout(() => {
         this.listFilterTextInput?.nativeElement.focus()
         this.buttonsViewport?.checkViewportSize()
       }, 0)
       if (this.editing) {
         this.selectionModel.reset()
-        this.modelIsDirty = false
+        this.modelIsDirty.set(false)
       }
       this.selectionModel.singleSelect =
         this.editing && !this.selectionModel.manyToOne
       this.opened.next(this)
     } else {
-      if (this.creating) {
+      if (this.creating()) {
         this.dropdown?.open()
-        this.creating = false
       } else {
         this.filterText = ''
         if (this.applyOnClose && this.selectionModel.isDirty()) {
@@ -877,7 +894,7 @@ export class FilterableDropdownComponent
   }
 
   listFilterEnter(): void {
-    let filtered = this.filterPipe.transform(this.items, this.filterText)
+    const filtered = this.filteredItems
     if (filtered.length == 1) {
       this.selectionModel.toggle(filtered[0].id)
       setTimeout(() => {
@@ -887,7 +904,11 @@ export class FilterableDropdownComponent
           this.dropdown.close()
         }
       }, 200)
-    } else if (filtered.length == 0 && this.createRef) {
+    } else if (
+      filtered.length == 0 &&
+      this.createRef &&
+      this.filterText?.length > 0
+    ) {
       this.createClicked()
     }
   }

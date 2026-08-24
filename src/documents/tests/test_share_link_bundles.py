@@ -31,7 +31,7 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         self.client.force_authenticate(self.user)
         self.document = DocumentFactory.create()
 
-    @mock.patch("documents.views.build_share_link_bundle.delay")
+    @mock.patch("documents.views.build_share_link_bundle.apply_async")
     def test_create_bundle_triggers_build_job(self, delay_mock) -> None:
         payload = {
             "document_ids": [self.document.pk],
@@ -45,7 +45,8 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         bundle = ShareLinkBundle.objects.get(pk=response.data["id"])
         self.assertEqual(bundle.documents.count(), 1)
         self.assertEqual(bundle.status, ShareLinkBundle.Status.PENDING)
-        delay_mock.assert_called_once_with(bundle.pk)
+        delay_mock.assert_called_once()
+        self.assertEqual(delay_mock.call_args.kwargs["kwargs"]["bundle_id"], bundle.pk)
 
     def test_create_bundle_rejects_missing_documents(self) -> None:
         payload = {
@@ -59,7 +60,7 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("document_ids", response.data)
 
-    @mock.patch("documents.views.has_perms_owner_aware", return_value=False)
+    @mock.patch("documents.views.permitted_document_ids", return_value=set())
     def test_create_bundle_rejects_insufficient_permissions(self, perms_mock) -> None:
         payload = {
             "document_ids": [self.document.pk],
@@ -73,7 +74,7 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         self.assertIn("document_ids", response.data)
         perms_mock.assert_called()
 
-    @mock.patch("documents.views.build_share_link_bundle.delay")
+    @mock.patch("documents.views.build_share_link_bundle.apply_async")
     def test_rebuild_bundle_resets_state(self, delay_mock) -> None:
         bundle = ShareLinkBundle.objects.create(
             slug="rebuild-slug",
@@ -94,7 +95,8 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         self.assertIsNone(bundle.last_error)
         self.assertIsNone(bundle.size_bytes)
         self.assertEqual(bundle.file_path, "")
-        delay_mock.assert_called_once_with(bundle.pk)
+        delay_mock.assert_called_once()
+        self.assertEqual(delay_mock.call_args.kwargs["kwargs"]["bundle_id"], bundle.pk)
 
     def test_rebuild_bundle_rejects_processing_status(self) -> None:
         bundle = ShareLinkBundle.objects.create(
@@ -122,7 +124,7 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         self.assertIn("document_ids", response.data)
 
     def test_download_ready_bundle_streams_file(self) -> None:
-        bundle_file = Path(self.dirs.media_dir) / "bundles" / "ready.zip"
+        bundle_file = settings.SHARE_LINK_BUNDLE_DIR / "bundles" / "ready.zip"
         bundle_file.parent.mkdir(parents=True, exist_ok=True)
         bundle_file.write_bytes(b"binary-zip-content")
 
@@ -130,7 +132,7 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
             slug="readyslug",
             file_version=ShareLink.FileVersion.ARCHIVE,
             status=ShareLinkBundle.Status.READY,
-            file_path=str(bundle_file),
+            file_path=str(bundle_file.relative_to(settings.SHARE_LINK_BUNDLE_DIR)),
         )
         bundle.documents.set([self.document])
 
@@ -197,11 +199,11 @@ class ShareLinkBundleTaskTests(DirectoriesMixin, APITestCase):
         self.document = DocumentFactory.create()
 
     def test_cleanup_expired_share_link_bundles(self) -> None:
-        expired_path = Path(self.dirs.media_dir) / "expired.zip"
+        expired_path = settings.SHARE_LINK_BUNDLE_DIR / "expired.zip"
         expired_path.parent.mkdir(parents=True, exist_ok=True)
         expired_path.write_bytes(b"expired")
 
-        active_path = Path(self.dirs.media_dir) / "active.zip"
+        active_path = settings.SHARE_LINK_BUNDLE_DIR / "active.zip"
         active_path.write_bytes(b"active")
 
         expired_bundle = ShareLinkBundle.objects.create(
@@ -209,7 +211,7 @@ class ShareLinkBundleTaskTests(DirectoriesMixin, APITestCase):
             file_version=ShareLink.FileVersion.ARCHIVE,
             status=ShareLinkBundle.Status.READY,
             expiration=timezone.now() - timedelta(days=1),
-            file_path=str(expired_path),
+            file_path=expired_path.name,
         )
         expired_bundle.documents.set([self.document])
 
@@ -218,7 +220,7 @@ class ShareLinkBundleTaskTests(DirectoriesMixin, APITestCase):
             file_version=ShareLink.FileVersion.ARCHIVE,
             status=ShareLinkBundle.Status.READY,
             expiration=timezone.now() + timedelta(days=1),
-            file_path=str(active_path),
+            file_path=active_path.name,
         )
         active_bundle.documents.set([self.document])
 
@@ -278,6 +280,7 @@ class ShareLinkBundleBuildTaskTests(DirectoriesMixin, APITestCase):
             self.document.archive_filename = f"{self.document.pk:07}.pdf"
             self.document.save()
             path = self.document.archive_path
+            assert path is not None
         else:
             path = self.document.source_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,6 +305,7 @@ class ShareLinkBundleBuildTaskTests(DirectoriesMixin, APITestCase):
         self.assertGreater(bundle.size_bytes or 0, 0)
         final_path = bundle.absolute_file_path
         self.assertIsNotNone(final_path)
+        assert final_path is not None
         self.assertTrue(final_path.exists())
         with zipfile.ZipFile(final_path) as zipf:
             names = zipf.namelist()
@@ -325,6 +329,7 @@ class ShareLinkBundleBuildTaskTests(DirectoriesMixin, APITestCase):
         bundle.refresh_from_db()
         final_path = bundle.absolute_file_path
         self.assertIsNotNone(final_path)
+        assert final_path is not None
         self.assertTrue(final_path.exists())
         self.assertNotEqual(final_path.read_bytes(), b"old")
 
@@ -352,6 +357,7 @@ class ShareLinkBundleBuildTaskTests(DirectoriesMixin, APITestCase):
         bundle.refresh_from_db()
         self.assertEqual(bundle.status, ShareLinkBundle.Status.FAILED)
         self.assertIsInstance(bundle.last_error, dict)
+        assert isinstance(bundle.last_error, dict)
         self.assertEqual(bundle.last_error.get("message"), "zip failure")
         self.assertEqual(bundle.last_error.get("exception_type"), "RuntimeError")
         scratch_zips = list(Path(settings.SCRATCH_DIR).glob("*.zip"))
@@ -418,7 +424,7 @@ class ShareLinkBundleFilterSetTests(DirectoriesMixin, APITestCase):
 
 
 class ShareLinkBundleModelTests(DirectoriesMixin, APITestCase):
-    def test_absolute_file_path_handles_relative_and_absolute(self) -> None:
+    def test_absolute_file_path_handles_relative_path(self) -> None:
         relative_path = Path("relative.zip")
         bundle = ShareLinkBundle.objects.create(
             slug="relative-bundle",
@@ -431,10 +437,23 @@ class ShareLinkBundleModelTests(DirectoriesMixin, APITestCase):
             (settings.SHARE_LINK_BUNDLE_DIR / relative_path).resolve(),
         )
 
-        absolute_path = Path(self.dirs.media_dir) / "absolute.zip"
-        bundle.file_path = str(absolute_path)
+    def test_absolute_file_path_rejects_absolute_path(self) -> None:
+        bundle = ShareLinkBundle.objects.create(
+            slug="absolute-bundle",
+            file_version=ShareLink.FileVersion.ORIGINAL,
+            file_path=str(Path(self.dirs.media_dir) / "absolute.zip"),
+        )
 
-        self.assertEqual(bundle.absolute_file_path.resolve(), absolute_path.resolve())
+        self.assertIsNone(bundle.absolute_file_path)
+
+    def test_absolute_file_path_rejects_traversal_outside_bundle_dir(self) -> None:
+        bundle = ShareLinkBundle.objects.create(
+            slug="traversal-bundle",
+            file_version=ShareLink.FileVersion.ORIGINAL,
+            file_path="../escaped.zip",
+        )
+
+        self.assertIsNone(bundle.absolute_file_path)
 
     def test_str_returns_translated_slug(self) -> None:
         bundle = ShareLinkBundle.objects.create(

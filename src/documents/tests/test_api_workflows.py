@@ -99,6 +99,40 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
             self.action.assign_correspondent.pk,
         )
 
+    def test_api_get_workflow_actions_ordered(self) -> None:
+        """
+        GIVEN:
+            - A workflow with two actions added in reverse order (order=1 before order=0)
+        WHEN:
+            - API is called to get workflows
+        THEN:
+            - Actions are returned sorted by order ascending
+        """
+        # Created before action_first so its pk is lower — ensures pk order
+        # disagrees with the order field, catching regressions if order_by is removed.
+        action_second = WorkflowAction.objects.create(
+            assign_title="Second action",
+            order=1,
+        )
+        action_first = WorkflowAction.objects.create(
+            assign_title="First action",
+            order=0,
+        )
+        self.workflow.actions.add(action_second)
+        self.workflow.actions.add(action_first)
+
+        response = self.client.get(self.ENDPOINT, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        resp_actions = response.data["results"][0]["actions"]
+        action_ids = [a["id"] for a in resp_actions]
+        self.assertIn(action_first.id, action_ids)
+        self.assertIn(action_second.id, action_ids)
+        self.assertLess(
+            action_ids.index(action_first.id),
+            action_ids.index(action_second.id),
+        )
+
     def test_api_create_workflow(self) -> None:
         """
         GIVEN:
@@ -239,6 +273,7 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
         self.assertEqual(Workflow.objects.count(), 2)
         workflow = Workflow.objects.get(name="Workflow 2")
         trigger = workflow.triggers.first()
+        assert trigger is not None
         self.assertSetEqual(
             set(trigger.filter_has_tags.values_list("id", flat=True)),
             {self.t1.id},
@@ -316,11 +351,45 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
 
         self.assertEqual(WorkflowTrigger.objects.count(), 1)
 
-    def test_api_create_invalid_assign_title(self) -> None:
+    def test_api_create_complex_assign_title(self) -> None:
         """
         GIVEN:
             - API request to create a workflow
-            - Invalid f-string for assign_title
+            - Template using Jinja flow control statements
+        WHEN:
+            - API is called
+        THEN:
+            - Workflow is created
+        """
+        response = self.client.post(
+            self.ENDPOINT,
+            json.dumps(
+                {
+                    "name": "Workflow 2",
+                    "order": 1,
+                    "triggers": [
+                        {
+                            "type": WorkflowTrigger.WorkflowTriggerType.DOCUMENT_UPDATED,
+                        },
+                    ],
+                    "actions": [
+                        {
+                            "assign_title": '{# this is a comment #}foo{% if created_year < 2000 %}bar{% endif %}{{ "{:04d}".format(42) }}',
+                        },
+                    ],
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        self.assertEqual(Workflow.objects.count(), 2)
+
+    def test_api_create_invalid_assign_title_syntax_error(self) -> None:
+        """
+        GIVEN:
+            - API request to create a workflow
+            - Invalid template for assign_title
         WHEN:
             - API is called
         THEN:
@@ -331,7 +400,7 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
             self.ENDPOINT,
             json.dumps(
                 {
-                    "name": "Workflow 1",
+                    "name": "Workflow 2",
                     "order": 1,
                     "triggers": [
                         {
@@ -340,7 +409,7 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
                     ],
                     "actions": [
                         {
-                            "assign_title": "{created_year]",
+                            "assign_title": "{{created_year}",
                         },
                     ],
                 },
@@ -349,7 +418,89 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(
-            "Invalid f-string detected",
+            "Template syntax error",
+            response.data["actions"][0]["assign_title"][0],
+        )
+
+        self.assertEqual(Workflow.objects.count(), 1)
+
+    def test_api_create_invalid_assign_title_assertion_error(self) -> None:
+        """
+        GIVEN:
+            - API request to create a workflow
+            - Template using unknown filters for assign_title
+        WHEN:
+            - API is called
+        THEN:
+            - Correct HTTP 400 response
+            - No objects are created
+        """
+        response = self.client.post(
+            self.ENDPOINT,
+            json.dumps(
+                {
+                    "name": "Workflow 2",
+                    "order": 1,
+                    "triggers": [
+                        {
+                            "type": WorkflowTrigger.WorkflowTriggerType.DOCUMENT_UPDATED,
+                        },
+                    ],
+                    "actions": [
+                        {
+                            "assign_title": "{{ created_year | foo }}",
+                        },
+                    ],
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Template assertion error",
+            response.data["actions"][0]["assign_title"][0],
+        )
+
+        self.assertEqual(Workflow.objects.count(), 1)
+
+    def test_api_create_invalid_assign_title_unknown_placeholder(self) -> None:
+        """
+        GIVEN:
+            - API request to create a workflow
+            - Template with unknown placeholders for assign_title
+        WHEN:
+            - API is called
+        THEN:
+            - Correct HTTP 400 response
+            - No objects are created
+        """
+        response = self.client.post(
+            self.ENDPOINT,
+            json.dumps(
+                {
+                    "name": "Workflow 2",
+                    "order": 1,
+                    "triggers": [
+                        {
+                            "type": WorkflowTrigger.WorkflowTriggerType.DOCUMENT_UPDATED,
+                        },
+                    ],
+                    "actions": [
+                        {
+                            "assign_title": "{{creation_year}}",
+                        },
+                    ],
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Template references unknown placeholders",
+            response.data["actions"][0]["assign_title"][0],
+        )
+        self.assertIn(
+            "creation_year",
             response.data["actions"][0]["assign_title"][0],
         )
 
@@ -387,6 +538,11 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
             json.dumps(
                 {
                     "assign_title": "",
+                    "assign_custom_fields": [self.cf1.id, self.cf2.id],
+                    "assign_custom_fields_values": {
+                        str(self.cf1.id): "",
+                        str(self.cf2.id): 0,
+                    },
                 },
             ),
             content_type="application/json",
@@ -394,6 +550,10 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         action = WorkflowAction.objects.get(id=response.data["id"])
         self.assertIsNone(action.assign_title)
+        self.assertEqual(
+            action.assign_custom_fields_values,
+            {str(self.cf1.id): None, str(self.cf2.id): 0},
+        )
 
         response = self.client.post(
             self.ENDPOINT_TRIGGERS,
@@ -459,44 +619,24 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         workflow = Workflow.objects.get(id=response.data["id"])
         self.assertEqual(workflow.name, "Workflow Updated")
-        self.assertEqual(workflow.triggers.first().filter_has_tags.first(), self.t1)
+        trigger = workflow.triggers.first()
+        assert trigger is not None
+        action = workflow.actions.first()
+        assert action is not None
+        self.assertEqual(trigger.filter_has_tags.first(), self.t1)
+        self.assertEqual(trigger.filter_has_all_tags.first(), self.t2)
+        self.assertEqual(trigger.filter_has_not_tags.first(), self.t3)
+        self.assertEqual(trigger.filter_has_any_correspondents.first(), self.c)
+        self.assertEqual(trigger.filter_has_not_correspondents.first(), self.c2)
+        self.assertEqual(trigger.filter_has_any_document_types.first(), self.dt)
+        self.assertEqual(trigger.filter_has_not_document_types.first(), self.dt2)
+        self.assertEqual(trigger.filter_has_any_storage_paths.first(), self.sp)
+        self.assertEqual(trigger.filter_has_not_storage_paths.first(), self.sp2)
         self.assertEqual(
-            workflow.triggers.first().filter_has_all_tags.first(),
-            self.t2,
-        )
-        self.assertEqual(
-            workflow.triggers.first().filter_has_not_tags.first(),
-            self.t3,
-        )
-        self.assertEqual(
-            workflow.triggers.first().filter_has_any_correspondents.first(),
-            self.c,
-        )
-        self.assertEqual(
-            workflow.triggers.first().filter_has_not_correspondents.first(),
-            self.c2,
-        )
-        self.assertEqual(
-            workflow.triggers.first().filter_has_any_document_types.first(),
-            self.dt,
-        )
-        self.assertEqual(
-            workflow.triggers.first().filter_has_not_document_types.first(),
-            self.dt2,
-        )
-        self.assertEqual(
-            workflow.triggers.first().filter_has_any_storage_paths.first(),
-            self.sp,
-        )
-        self.assertEqual(
-            workflow.triggers.first().filter_has_not_storage_paths.first(),
-            self.sp2,
-        )
-        self.assertEqual(
-            workflow.triggers.first().filter_custom_field_query,
+            trigger.filter_custom_field_query,
             json.dumps(["AND", [[self.cf1.id, "exact", "value"]]]),
         )
-        self.assertEqual(workflow.actions.first().assign_title, "Action New Title")
+        self.assertEqual(action.assign_title, "Action New Title")
 
     def test_api_update_workflow_no_trigger_actions(self) -> None:
         """
@@ -578,9 +718,13 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         workflow = Workflow.objects.get(id=response.data["id"])
         self.assertEqual(WorkflowTrigger.objects.all().count(), 1)
-        self.assertNotEqual(workflow.triggers.first().id, self.trigger.id)
+        new_trigger = workflow.triggers.first()
+        assert new_trigger is not None
+        self.assertNotEqual(new_trigger.id, self.trigger.id)
         self.assertEqual(WorkflowAction.objects.all().count(), 1)
-        self.assertNotEqual(workflow.actions.first().id, self.action.id)
+        new_action = workflow.actions.first()
+        assert new_action is not None
+        self.assertNotEqual(new_action.id, self.action.id)
 
     def test_email_action_validation(self) -> None:
         """
@@ -839,7 +983,7 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
         self.action.refresh_from_db()
         self.assertEqual(self.action.assign_title, "Patched Title")
 
-    def test_password_action_passwords_field(self):
+    def test_password_action_passwords_field(self) -> None:
         """
         GIVEN:
             - Nothing
@@ -862,7 +1006,7 @@ class TestApiWorkflows(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["passwords"], passwords)
 
-    def test_password_action_invalid_passwords_field(self):
+    def test_password_action_invalid_passwords_field(self) -> None:
         """
         GIVEN:
             - Nothing

@@ -1,5 +1,28 @@
 # v3 Migration Guide
 
+## Pre-Requisites
+
+Upgrading to Paperless-ngx v3 can only be performed from version 2.20.15. If you are running an older version, please upgrade to v2.20.15 before proceeding with the v3 upgrade.
+
+## Secret Key is Now Required
+
+The `PAPERLESS_SECRET_KEY` environment variable is now required. This is a critical security setting used for cryptographic signing and should be set to a long, random value.
+
+### Action Required
+
+If you are upgrading an existing installation, you must now set `PAPERLESS_SECRET_KEY` explicitly.
+
+If your installation was relying on the previous built-in default key, you have two options:
+
+- Set `PAPERLESS_SECRET_KEY` to that previous value to preserve existing sessions and tokens.
+- Set `PAPERLESS_SECRET_KEY` to a new random value to improve security, understanding that this will invalidate existing sessions and other signed tokens.
+
+For new installations, or if you choose to rotate the key, you may generate a new secret key with:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(64))"
+```
+
 ## Consumer Settings Changes
 
 The v3 consumer command uses a [different library](https://watchfiles.helpmanual.io/) to unify
@@ -17,6 +40,10 @@ separating the directory ignore from the file ignore.
 | `CONSUMER_POLLING_RETRY_COUNT` | _Removed_                                                                           | Automatic with stability tracking                                                    |
 | `CONSUMER_IGNORE_PATTERNS`     | [`CONSUMER_IGNORE_PATTERNS`](configuration.md#PAPERLESS_CONSUMER_IGNORE_PATTERNS)   | **Now regex, not fnmatch**; user patterns are added to (not replacing) default ones  |
 | _New_                          | [`CONSUMER_IGNORE_DIRS`](configuration.md#PAPERLESS_CONSUMER_IGNORE_DIRS)           | Additional directories to ignore; user entries are added to (not replacing) defaults |
+
+## Duplicate Handling Changes
+
+Paperless-ngx v3 no longer rejects duplicate documents by default. Instead, it now allows duplicates but adds a way to identify them via the UI. To (re-)enable duplicate rejection, set `PAPERLESS_CONSUMER_DELETE_DUPLICATES=true` in your environment.
 
 ## Encryption Support
 
@@ -101,8 +128,102 @@ Users with any of the deprecated variables set should migrate to `PAPERLESS_DB_O
 Multiple options are combined in a single value:
 
 ```bash
-PAPERLESS_DB_OPTIONS="sslmode=require;sslrootcert=/certs/ca.pem;pool.max_size=10"
+PAPERLESS_DB_OPTIONS="sslmode=require,sslrootcert=/certs/ca.pem,pool.max_size=10"
 ```
+
+## OCR and Archive File Generation Settings
+
+The settings that control OCR behaviour and archive file generation have been redesigned. The old settings that coupled these two concerns together are **removed** - old values are not silently honoured; a startup warning is logged if any removed variable is still set in your environment.
+
+### Removed settings
+
+| Removed Setting                             | Replacement                                                           |
+| ------------------------------------------- | --------------------------------------------------------------------- |
+| `PAPERLESS_OCR_MODE=skip`                   | `PAPERLESS_OCR_MODE=auto` (new default)                               |
+| `PAPERLESS_OCR_MODE=skip_noarchive`         | `PAPERLESS_OCR_MODE=auto` + `PAPERLESS_ARCHIVE_FILE_GENERATION=never` |
+| `PAPERLESS_OCR_SKIP_ARCHIVE_FILE=never`     | `PAPERLESS_ARCHIVE_FILE_GENERATION=always`                            |
+| `PAPERLESS_OCR_SKIP_ARCHIVE_FILE=with_text` | `PAPERLESS_ARCHIVE_FILE_GENERATION=auto` (new default)                |
+| `PAPERLESS_OCR_SKIP_ARCHIVE_FILE=always`    | `PAPERLESS_ARCHIVE_FILE_GENERATION=never`                             |
+
+### What changed and why
+
+Previously, `OCR_MODE` conflated two independent concerns: whether to run OCR and whether to produce an archive. `skip` meant "skip OCR if text exists, but always produce an archive". `skip_noarchive` meant "skip OCR if text exists, and also skip the archive". This made it impossible to, for example, disable OCR entirely while still producing archives.
+
+The new settings are independent:
+
+- [`PAPERLESS_OCR_MODE`](configuration.md#PAPERLESS_OCR_MODE) controls OCR: `auto` (default), `force`, `redo`, `off`.
+- [`PAPERLESS_ARCHIVE_FILE_GENERATION`](configuration.md#PAPERLESS_ARCHIVE_FILE_GENERATION) controls archive production: `auto` (default), `always`, `never`.
+
+### Database configuration
+
+If you changed OCR settings via the admin UI (ApplicationConfiguration), the database values are **migrated automatically** during the upgrade. `mode` values (`skip` / `skip_noarchive`) are mapped to their new equivalents and explicit `skip_archive_file` values are converted to the new `archive_file_generation` field. Users who relied on the old defaults must set `archive_file_generation` to `always` to preserve the v2 behaviour of always creating an archive. After upgrading, review the OCR settings in the admin UI to confirm the migrated values match your intent.
+
+### Action Required
+
+Remove any `PAPERLESS_OCR_SKIP_ARCHIVE_FILE` variable from your environment. If you relied on `OCR_MODE=skip` or `OCR_MODE=skip_noarchive`, update accordingly:
+
+```bash
+# v2: skip OCR when text present, always archive
+PAPERLESS_OCR_MODE=skip
+# v3: equivalent
+PAPERLESS_OCR_MODE=auto
+PAPERLESS_ARCHIVE_FILE_GENERATION=always
+
+# v2: skip OCR when text present, skip archive too
+PAPERLESS_OCR_MODE=skip_noarchive
+# v3: equivalent
+PAPERLESS_OCR_MODE=auto
+PAPERLESS_ARCHIVE_FILE_GENERATION=never
+
+# v2: always skip archive
+PAPERLESS_OCR_SKIP_ARCHIVE_FILE=always
+# v3: equivalent
+PAPERLESS_ARCHIVE_FILE_GENERATION=never
+
+# v2: skip archive only for born-digital docs
+PAPERLESS_OCR_SKIP_ARCHIVE_FILE=with_text
+# v3: equivalent (auto is the new default)
+PAPERLESS_ARCHIVE_FILE_GENERATION=auto
+```
+
+### Remote OCR parser
+
+If you use the **remote OCR parser** (Azure AI), `ARCHIVE_FILE_GENERATION` is
+honored the same way as for the local engine: when no archive is requested
+(`never`, or `auto` with a born-digital PDF), the remote engine is skipped
+entirely and locally-extracted text is used instead, avoiding an unnecessary
+API call and a duplicate text layer.
+
+## Search Index (Whoosh -> Tantivy)
+
+The full-text search backend has been replaced with [Tantivy](https://github.com/quickwit-oss/tantivy).
+The index format is incompatible with Whoosh, so **the search index is automatically rebuilt from
+scratch on first startup after upgrading**. No manual action is required for the rebuild itself.
+
+### Note and custom field search syntax
+
+The old Whoosh index exposed `note` and `custom_field` as flat text fields that were included in
+unqualified searches (e.g. just typing `invoice` would match note content). With Tantivy these are
+now structured JSON fields accessed via dotted paths:
+
+| Old syntax           | New syntax                  |
+| -------------------- | --------------------------- |
+| `note:query`         | `notes.note:query`          |
+| `custom_field:query` | `custom_fields.value:query` |
+
+**Saved views are migrated automatically.** Any saved view filter rule that used an explicit
+`note:` or `custom_field:` field prefix in a fulltext query is rewritten to the new syntax by a
+data migration that runs on upgrade.
+
+**Unqualified queries are not migrated.** If you had a saved view with a plain search term (e.g.
+`invoice`) that happened to match note content or custom field values, it will no longer return
+those matches. Update those queries to use the explicit prefix, for example:
+
+```
+invoice OR notes.note:invoice OR custom_fields.value:invoice
+```
+
+Custom field names can also be searched with `custom_fields.name:fieldname`.
 
 ## OpenID Connect Token Endpoint Authentication
 
@@ -130,3 +251,149 @@ For example:
   }
 }
 ```
+
+## Task History Cleared on Upgrade
+
+The task tracking system has been redesigned in this release. All existing task history records are dropped from the database during the upgrade. Previously completed, failed, or acknowledged tasks will no longer appear in the task list after upgrading.
+
+No user action is required.
+
+## Consume Script Positional Arguments Removed
+
+Pre- and post-consumption scripts no longer receive positional arguments. All information is
+now passed exclusively via environment variables, which have been available since earlier versions.
+
+### Pre-consumption script
+
+Previously, the original file path was passed as `$1`. It is now only available as
+`DOCUMENT_SOURCE_PATH`.
+
+**Before:**
+
+```bash
+#!/usr/bin/env bash
+# $1 was the original file path
+process_document "$1"
+```
+
+**After:**
+
+```bash
+#!/usr/bin/env bash
+process_document "${DOCUMENT_SOURCE_PATH}"
+```
+
+### Post-consumption script
+
+Previously, document metadata was passed as positional arguments `$1` through `$8`:
+
+| Argument | Environment Variable Equivalent |
+| -------- | ------------------------------- |
+| `$1`     | `DOCUMENT_ID`                   |
+| `$2`     | `DOCUMENT_FILE_NAME`            |
+| `$3`     | `DOCUMENT_SOURCE_PATH`          |
+| `$4`     | `DOCUMENT_THUMBNAIL_PATH`       |
+| `$5`     | `DOCUMENT_DOWNLOAD_URL`         |
+| `$6`     | `DOCUMENT_THUMBNAIL_URL`        |
+| `$7`     | `DOCUMENT_CORRESPONDENT`        |
+| `$8`     | `DOCUMENT_TAGS`                 |
+
+**Before:**
+
+```bash
+#!/usr/bin/env bash
+DOCUMENT_ID=$1
+CORRESPONDENT=$7
+TAGS=$8
+```
+
+**After:**
+
+```bash
+#!/usr/bin/env bash
+# Use environment variables directly
+echo "Document ${DOCUMENT_ID} from ${DOCUMENT_CORRESPONDENT} tagged: ${DOCUMENT_TAGS}"
+```
+
+### Action Required
+
+Update any pre- or post-consumption scripts that read `$1`, `$2`, etc. to use the
+corresponding environment variables instead. Environment variables have been the preferred
+option since v1.8.0.
+
+## Reverse Proxy and Login Rate Limiting
+
+Allauth changed how it determines the client IP address for login rate limiting. Users running
+behind a reverse proxy may need to set
+[`PAPERLESS_TRUSTED_PROXIES`](configuration.md#PAPERLESS_TRUSTED_PROXIES),
+[`PAPERLESS_ALLAUTH_TRUSTED_PROXY_COUNT`](configuration.md#PAPERLESS_ALLAUTH_TRUSTED_PROXY_COUNT),
+[`PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER`](configuration.md#PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER),
+or a combination of these settings to avoid `403 Forbidden` errors on login.
+The proxy count is the number of proxy hops in `X-Forwarded-For`, which may
+differ from the number of configured proxy IP addresses.
+
+## Minimum CPU Requirements (NumPy Baseline)
+
+Starting with NumPy 2.4.0, official `manylinux` x86_64 wheels are compiled with a minimum
+CPU baseline of `x86-64-v2`, which requires SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, and
+CMPXCHG16B. This is a [deliberate upstream change](https://github.com/numpy/numpy/issues/27851)
+citing that these instructions have been present in over 99.7% of CPUs since 2008
+([Intel](<https://en.wikipedia.org/wiki/Nehalem_(microarchitecture)>)) or 2011
+([AMD](<https://en.wikipedia.org/wiki/Bulldozer_(microarchitecture)>)).
+
+NumPy is a dependency of the document classifier (via scikit-learn), so any CPU that
+predates SSE4.2 support will crash with `SIGILL` (illegal instruction) when the classifier
+is loaded or trained, regardless of whether AI features are enabled.
+
+This differs from NumPy's optional SIMD dispatch (e.g. AVX2, AVX512), which is detected and
+selected safely at runtime - the `x86-64-v2` requirement above is a hard floor baked into the
+wheel, with no runtime fallback.
+
+### Affected hardware
+
+CPUs older than roughly 2008 (Intel) or 2011 (AMD) that lack SSE4.2 support. This is more
+likely to affect low-power or embedded hardware - e.g. early Atom, Celeron, or pre-Bulldozer
+AMD chips - than typical desktop or server hardware from the last decade.
+
+Check for SSE4.2 support with:
+
+```bash
+grep -o -m1 sse4_2 /proc/cpuinfo
+```
+
+If this prints nothing, your CPU is affected.
+
+### Symptoms
+
+The Celery worker (and potentially the web server) repeatedly crashes and restarts with a
+`SIGILL` error, typically visible in `dmesg`/`journalctl` as a `trap invalid opcode` inside
+`_multiarray_umath...so`. Because the classifier is trained on a periodic schedule
+(hourly, by default), affected instances see intermittent, hard-to-reproduce document
+consumption failures whenever that scheduled task runs and takes down the worker process
+mid-task.
+
+### Action Required (for affected hardware only)
+
+There is no way to make the classifier itself work on such CPUs - it requires an unofficial
+NumPy build with `cpu-baseline=none`, which is not something we can ship. The practical
+path forward is to stop the classifier from ever loading or training, which avoids
+importing NumPy at all:
+
+```bash
+PAPERLESS_TRAIN_TASK_CRON=disable
+```
+
+This disables the periodic classifier training task (see
+[`PAPERLESS_TRAIN_TASK_CRON`](configuration.md#PAPERLESS_TRAIN_TASK_CRON)). Automatic
+matching based on the classifier (suggested correspondents, document types, tags, and
+storage paths from trained rules) will no longer be available, but rule-based matching is
+unaffected, and document consumption itself will no longer be at risk of crashing the
+worker.
+
+## Database Migrations
+
+Some integer fields have been changed to smaller types to reduce database size. If you have any `MailRule` records with a `maximum_age` greater than 32767, they will be clamped to 32767 during the migration to avoid errors during migration.
+
+### Action Required
+
+No user action is required. The migration will automatically clamp any `MailRule.maximum_age` values greater than 32767 to 32767 during the migration process.

@@ -64,9 +64,9 @@ describe('PermissionsFilterDropdownComponent', () => {
         {
           provide: SettingsService,
           useValue: {
-            currentUser: {
+            currentUser: () => ({
               id: currentUserID,
-            },
+            }),
           },
         },
         provideHttpClient(withInterceptorsFromDi()),
@@ -92,6 +92,58 @@ describe('PermissionsFilterDropdownComponent', () => {
     component.setFilter(OwnerFilterType.NONE)
     component.selectionModel.hideUnowned = true
     expect(component.isActive).toBeTruthy()
+  })
+
+  it('should describe concrete user filters honestly', () => {
+    component.selectionModel.ownerFilter = OwnerFilterType.SELF
+    component.selectionModel.userID = 1
+    expect(component.ownerFilterLabel).toEqual('Owned by user1')
+
+    component.selectionModel.ownerFilter = OwnerFilterType.NOT_SELF
+    component.selectionModel.excludeUsers = [1]
+    expect(component.ownerExclusionFilterLabel).toEqual('Not owned by user1')
+
+    component.selectionModel.ownerFilter = OwnerFilterType.SHARED_BY_ME
+    component.selectionModel.userID = 1
+    expect(component.sharedByFilterLabel).toEqual('Shared by user1')
+  })
+
+  it('should describe concrete filters when usernames are unavailable', () => {
+    component.selectionModel.ownerFilter = OwnerFilterType.SELF
+    component.selectionModel.userID = 99
+    expect(component.ownerFilterLabel).toEqual('Owned by another user')
+
+    component.selectionModel.ownerFilter = OwnerFilterType.NOT_SELF
+    component.selectionModel.excludeUsers = [99]
+    expect(component.ownerExclusionFilterLabel).toEqual(
+      'Not owned by another user'
+    )
+
+    component.selectionModel.excludeUsers = [98, 99]
+    expect(component.ownerExclusionFilterLabel).toEqual(
+      'Not owned by selected users'
+    )
+
+    component.selectionModel.ownerFilter = OwnerFilterType.SHARED_BY_ME
+    component.selectionModel.userID = 99
+    expect(component.sharedByFilterLabel).toEqual('Shared by another user')
+  })
+
+  it('should retain relative labels for filters bound to the current user', () => {
+    component.selectionModel.userID = currentUserID
+    expect(component.ownerFilterLabel).toEqual('My documents')
+    expect(component.sharedByFilterLabel).toEqual('Shared by me')
+
+    component.selectionModel.excludeUsers = [currentUserID]
+    expect(component.ownerExclusionFilterLabel).toEqual('Shared with me')
+  })
+
+  it('should retain relative labels for inactive filter choices', () => {
+    component.selectionModel.ownerFilter = OwnerFilterType.NONE
+
+    expect(component.ownerFilterLabel).toEqual('My documents')
+    expect(component.ownerExclusionFilterLabel).toEqual('Shared with me')
+    expect(component.sharedByFilterLabel).toEqual('Shared by me')
   })
 
   it('should support reset', () => {

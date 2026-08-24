@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import logging
 import tempfile
 from pathlib import Path
@@ -9,8 +10,10 @@ from auditlog.context import disable_auditlog
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import DatabaseError
+from django.db import connection
 from django.test import TestCase
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from documents.file_handling import create_source_path_directory
@@ -23,6 +26,7 @@ from documents.models import CustomFieldInstance
 from documents.models import Document
 from documents.models import DocumentType
 from documents.models import StoragePath
+from documents.serialisers import DocumentSerializer
 from documents.tasks import empty_trash
 from documents.tests.factories import DocumentFactory
 from documents.tests.utils import DirectoriesMixin
@@ -30,6 +34,36 @@ from documents.tests.utils import FileSystemAssertsMixin
 
 
 class TestFileHandling(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
+    @override_settings(FILENAME_FORMAT="{title}")
+    def test_generate_unique_filename_renders_template_once(self) -> None:
+        document = Document.objects.create(
+            title="collision",
+            mime_type="application/pdf",
+        )
+        Document.objects.filter(pk=document.pk).update(filename="collision_03.pdf")
+        document.refresh_from_db()
+
+        for filename in (
+            "collision.pdf",
+            "collision_01.pdf",
+            "collision_02.pdf",
+            "collision_03.pdf",
+        ):
+            (settings.ORIGINALS_DIR / filename).touch()
+
+        with CaptureQueriesContext(connection) as queries:
+            generated = generate_unique_filename(document)
+
+        relation_queries = [
+            query["sql"]
+            for query in queries.captured_queries
+            if "documents_tag" in query["sql"]
+            or "documents_customfieldinstance" in query["sql"]
+        ]
+
+        self.assertEqual(generated, Path("collision_03.pdf"))
+        self.assertEqual(len(relation_queries), 2)
+
     @override_settings(FILENAME_FORMAT="")
     def test_generate_source_filename(self) -> None:
         document = Document()
@@ -203,6 +237,92 @@ class TestFileHandling(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
                 settings.ORIGINALS_DIR / "none" / "none.pdf",
             )
             self.assertEqual(document.filename, "none/none.pdf")
+
+    @override_settings(FILENAME_FORMAT=None)
+    def test_stale_save_recovers_already_moved_files(self) -> None:
+        old_storage_path = StoragePath.objects.create(
+            name="old-path",
+            path="old/{{title}}",
+        )
+        new_storage_path = StoragePath.objects.create(
+            name="new-path",
+            path="new/{{title}}",
+        )
+        original_bytes = b"original"
+        archive_bytes = b"archive"
+
+        doc = Document.objects.create(
+            title="document",
+            mime_type="application/pdf",
+            checksum=hashlib.sha256(original_bytes).hexdigest(),
+            archive_checksum=hashlib.sha256(archive_bytes).hexdigest(),
+            filename="old/document.pdf",
+            archive_filename="old/document.pdf",
+            storage_path=old_storage_path,
+        )
+        create_source_path_directory(doc.source_path)
+        doc.source_path.write_bytes(original_bytes)
+        create_source_path_directory(doc.archive_path)
+        doc.archive_path.write_bytes(archive_bytes)
+
+        stale_doc = Document.objects.get(pk=doc.pk)
+        fresh_doc = Document.objects.get(pk=doc.pk)
+        fresh_doc.storage_path = new_storage_path
+        fresh_doc.save()
+        doc.refresh_from_db()
+        self.assertEqual(doc.filename, "new/document.pdf")
+        self.assertEqual(doc.archive_filename, "new/document.pdf")
+
+        stale_doc.storage_path = new_storage_path
+        stale_doc.save()
+
+        doc.refresh_from_db()
+        self.assertEqual(doc.filename, "new/document.pdf")
+        self.assertEqual(doc.archive_filename, "new/document.pdf")
+        self.assertIsFile(doc.source_path)
+        self.assertIsFile(doc.archive_path)
+        self.assertIsNotFile(settings.ORIGINALS_DIR / "old" / "document.pdf")
+        self.assertIsNotFile(settings.ARCHIVE_DIR / "old" / "document.pdf")
+
+    @override_settings(FILENAME_FORMAT="{title}")
+    def test_serializer_stale_update_does_not_clobber_filename(self) -> None:
+        old_path = settings.ORIGINALS_DIR / "original.pdf"
+        old_path.touch()
+        doc = Document.objects.create(
+            title="original",
+            mime_type="application/pdf",
+            checksum=hashlib.sha256(b"").hexdigest(),
+            filename="original.pdf",
+        )
+
+        first_instance = Document.objects.get(pk=doc.pk)
+        stale_instance = Document.objects.get(pk=doc.pk)
+
+        serializer = DocumentSerializer(
+            first_instance,
+            data={"title": "first"},
+            partial=True,
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        serializer.save()
+
+        doc.refresh_from_db()
+        self.assertEqual(doc.filename, "first.pdf")
+        self.assertIsFile(settings.ORIGINALS_DIR / "first.pdf")
+
+        serializer = DocumentSerializer(
+            stale_instance,
+            data={"title": "second"},
+            partial=True,
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        serializer.save()
+
+        doc.refresh_from_db()
+        self.assertEqual(doc.filename, "second.pdf")
+        self.assertIsFile(settings.ORIGINALS_DIR / "second.pdf")
+        self.assertIsNotFile(settings.ORIGINALS_DIR / "first.pdf")
+        self.assertIsNotFile(old_path)
 
     @override_settings(FILENAME_FORMAT="{correspondent}/{correspondent}")
     def test_document_delete(self) -> None:
@@ -1467,7 +1587,7 @@ class TestFilenameGeneration(DirectoriesMixin, TestCase):
             Path("somepath/asn-201-400/asn-3xx/Does Matter.pdf"),
         )
 
-    def test_template_related_context_keeps_legacy_string_coercion(self):
+    def test_template_related_context_keeps_legacy_string_coercion(self) -> None:
         """
         GIVEN:
             - A storage path template that uses related objects directly as strings
@@ -1861,7 +1981,7 @@ class TestCustomFieldFilenameUpdates(
         self.assertLessEqual(m.call_count, 1)
 
     @override_settings(FILENAME_FORMAT=None)
-    def test_overlong_storage_path_keeps_existing_filename(self):
+    def test_overlong_storage_path_keeps_existing_filename(self) -> None:
         initial_filename = generate_filename(self.doc)
         Document.objects.filter(pk=self.doc.pk).update(filename=str(initial_filename))
         self.doc.refresh_from_db()

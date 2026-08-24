@@ -3,8 +3,11 @@ from __future__ import annotations
 import functools
 import inspect
 import json
+import logging
 import operator
 from contextlib import contextmanager
+from decimal import Decimal
+from decimal import InvalidOperation
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -25,14 +28,17 @@ from django.db.models.functions import Cast
 from django.utils.translation import gettext_lazy as _
 from django_filters import DateFilter
 from django_filters.rest_framework import BooleanFilter
+from django_filters.rest_framework import CharFilter
+from django_filters.rest_framework import DateTimeFilter
 from django_filters.rest_framework import Filter
 from django_filters.rest_framework import FilterSet
+from django_filters.rest_framework import MultipleChoiceFilter
 from drf_spectacular.utils import extend_schema_field
 from guardian.utils import get_group_obj_perms_model
 from guardian.utils import get_user_obj_perms_model
 from rest_framework import serializers
+from rest_framework.filters import BaseFilterBackend
 from rest_framework.filters import OrderingFilter
-from rest_framework_guardian.filters import ObjectPermissionsFilter
 
 from documents.models import Correspondent
 from documents.models import CustomField
@@ -44,6 +50,7 @@ from documents.models import ShareLink
 from documents.models import ShareLinkBundle
 from documents.models import StoragePath
 from documents.models import Tag
+from documents.permissions import permitted_object_ids
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -76,6 +83,8 @@ DATETIME_KWARGS = [
 
 CUSTOM_FIELD_QUERY_MAX_DEPTH = 10
 CUSTOM_FIELD_QUERY_MAX_ATOMS = 20
+
+logger = logging.getLogger("paperless.api")
 
 
 class CorrespondentFilterSet(FilterSet):
@@ -153,7 +162,9 @@ class ObjectFilter(Filter):
 class InboxFilter(Filter):
     def filter(self, qs, value):
         if value == "true":
-            return qs.filter(tags__is_inbox_tag=True)
+            # A document can have more than one tag flagged as an inbox tag
+            # (nothing enforces uniqueness), so this join can multiply rows.
+            return qs.filter(tags__is_inbox_tag=True).distinct()
         elif value == "false":
             return qs.exclude(tags__is_inbox_tag=True)
         else:
@@ -162,9 +173,13 @@ class InboxFilter(Filter):
 
 @extend_schema_field(serializers.CharField)
 class TitleContentFilter(Filter):
+    # Deprecated but retained for existing saved views. UI uses Tantivy-backed `text` / `title_search` params.
     def filter(self, qs: Any, value: Any) -> Any:
         value = value.strip() if isinstance(value, str) else value
         if value:
+            logger.warning(
+                "Deprecated document filter parameter 'title_content' used; use `text` instead.",
+            )
             try:
                 return qs.filter(
                     Q(title__icontains=value) | Q(effective_content__icontains=value),
@@ -243,6 +258,9 @@ class CustomFieldsFilter(Filter):
     def filter(self, qs, value):
         value = value.strip() if isinstance(value, str) else value
         if value:
+            logger.warning(
+                "Deprecated document filter parameter 'custom_fields__icontains' used; use `custom_field_query` or advanced Tantivy field syntax instead.",
+            )
             fields_with_matching_selects = CustomField.objects.filter(
                 extra_data__icontains=value,
             )
@@ -253,6 +271,10 @@ class CustomFieldsFilter(Filter):
                     for _, option in enumerate(options):
                         if option.get("label").lower().find(value.lower()) != -1:
                             option_ids.extend([option.get("id")])
+            # A document with multiple custom field instances can match more
+            # than one of these OR-ed branches (or the same branch via
+            # different fields), each via its own join to custom_fields --
+            # dedupe explicitly rather than relying on the caller to.
             return (
                 qs.filter(custom_fields__field__name__icontains=value)
                 | qs.filter(custom_fields__value_text__icontains=value)
@@ -265,7 +287,7 @@ class CustomFieldsFilter(Filter):
                 | qs.filter(custom_fields__value_document_ids__icontains=value)
                 | qs.filter(custom_fields__value_select__in=option_ids)
                 | qs.filter(custom_fields__value_long_text__icontains=value)
-            )
+            ).distinct()
         else:
             return qs
 
@@ -277,6 +299,34 @@ class MimeTypeFilter(Filter):
             return qs.filter(mime_type__icontains=value)
         else:
             return qs
+
+
+class MonetaryAmountField(serializers.Field):
+    """
+    Accepts either a plain decimal string ("100", "100.00") or a currency-prefixed
+    string ("USD100.00") and returns the numeric amount as a Decimal.
+
+    Mirrors the logic of the value_monetary_amount generated field: if the value
+    starts with a non-digit, the first 3 characters are treated as a currency code
+    (ISO 4217) and stripped before parsing. This preserves backwards compatibility
+    with saved views that stored a currency-prefixed string as the filter value.
+    """
+
+    default_error_messages = {"invalid": "A valid number is required."}
+
+    def to_internal_value(self, data):
+        if not isinstance(data, str | int | float):
+            self.fail("invalid")
+        value = str(data).strip()
+        if value and not value[0].isdigit() and value[0] != "-":
+            value = value[3:]  # strip 3-char ISO 4217 currency code
+        try:
+            return Decimal(value)
+        except InvalidOperation:
+            self.fail("invalid")
+
+    def to_representation(self, value):
+        return str(value)
 
 
 class SelectField(serializers.CharField):
@@ -504,9 +554,8 @@ class CustomFieldQueryParser:
         value_field_name = CustomFieldInstance.get_value_field_name(
             custom_field.data_type,
         )
-        if (
-            custom_field.data_type == CustomField.FieldDataType.MONETARY
-            and op in self.EXPR_BY_CATEGORY["arithmetic"]
+        if custom_field.data_type == CustomField.FieldDataType.MONETARY and (
+            op in self.EXPR_BY_CATEGORY["arithmetic"] or op in {"exact", "in"}
         ):
             value_field_name = "value_monetary_amount"
         has_field = Q(custom_fields__field=custom_field)
@@ -616,6 +665,13 @@ class CustomFieldQueryParser:
         elif custom_field.data_type == CustomField.FieldDataType.URL:
             # For URL fields we don't need to be strict about validation (e.g., for istartswith).
             field = serializers.CharField()
+        elif custom_field.data_type == CustomField.FieldDataType.MONETARY and (
+            op in self.EXPR_BY_CATEGORY["arithmetic"] or op in {"exact", "in"}
+        ):
+            # These ops compare against value_monetary_amount (a DecimalField).
+            # MonetaryAmountField accepts both "100" and "USD100.00" for backwards
+            # compatibility with saved views that stored currency-prefixed values.
+            field = MonetaryAmountField()
         else:
             # The general case: inferred from the corresponding field in CustomFieldInstance.
             value_field_name = CustomFieldInstance.get_value_field_name(
@@ -668,9 +724,13 @@ class CustomFieldQueryParser:
             )
 
         # First we look up reverse links from the requested documents.
+        # Scoped to this specific field (not just any document link field) and
+        # excluding unset instances, which have a null value_document_ids and
+        # are equivalent to having no reverse link at all.
         links = CustomFieldInstance.objects.filter(
             document_id__in=value,
-            field__data_type=CustomField.FieldDataType.DOCUMENTLINK,
+            field=custom_field,
+            value_document_ids__isnull=False,
         )
 
         # Check if any of the requested IDs are missing.
@@ -722,7 +782,14 @@ class CustomFieldQueryFilter(Filter):
         )
         q, annotations = parser.parse(value)
 
-        return qs.annotate(**annotations).filter(q)
+        # The Count(...) annotations above require a GROUP BY/HAVING to evaluate.
+        # Applying them directly to `qs` mixes that HAVING with `qs`'s existing
+        # joins (e.g. repeated tag joins from tags__id__all, the object-permission
+        # OR-filter), which some backends (e.g. MariaDB) fail to plan correctly,
+        # raising "Unknown column ... in 'HAVING'". Evaluating the annotation on
+        # an isolated queryset keeps the GROUP BY/HAVING self-contained.
+        matching_ids = Document.objects.annotate(**annotations).filter(q).values("pk")
+        return qs.filter(pk__in=matching_ids)
 
 
 class DocumentFilterSet(FilterSet):
@@ -747,6 +814,7 @@ class DocumentFilterSet(FilterSet):
 
     is_in_inbox = InboxFilter()
 
+    # Deprecated, but keep for now for existing saved views
     title_content = TitleContentFilter()
 
     content__istartswith = EffectiveContentFilter(lookup_expr="istartswith")
@@ -756,6 +824,7 @@ class DocumentFilterSet(FilterSet):
 
     owner__id__none = ObjectFilter(field_name="owner", exclude=True)
 
+    # Deprecated, UI no longer includes CF text-search mode, but keep for now for existing saved views
     custom_fields__icontains = CustomFieldsFilter()
 
     custom_fields__id__all = ObjectFilter(field_name="custom_fields__field")
@@ -850,46 +919,149 @@ class ShareLinkBundleFilterSet(FilterSet):
 
 
 class PaperlessTaskFilterSet(FilterSet):
+    name = CharFilter(
+        method="filter_name",
+        label="Name",
+    )
+
+    result = CharFilter(
+        method="filter_result",
+        label="Result",
+    )
+
+    task_type = MultipleChoiceFilter(
+        choices=PaperlessTask.TaskType.choices,
+        label="Task Type",
+    )
+
+    trigger_source = MultipleChoiceFilter(
+        choices=PaperlessTask.TriggerSource.choices,
+        label="Trigger Source",
+    )
+
+    status = MultipleChoiceFilter(
+        choices=PaperlessTask.Status.choices,
+        label="Status",
+    )
+
+    is_complete = BooleanFilter(
+        method="filter_is_complete",
+        label="Is Complete",
+    )
+
     acknowledged = BooleanFilter(
         label="Acknowledged",
         field_name="acknowledged",
     )
 
+    date_created_after = DateTimeFilter(
+        field_name="date_created",
+        lookup_expr="gte",
+        label="Created After",
+    )
+
+    date_created_before = DateTimeFilter(
+        field_name="date_created",
+        lookup_expr="lte",
+        label="Created Before",
+    )
+
     class Meta:
         model = PaperlessTask
-        fields = {
-            "type": ["exact"],
-            "task_name": ["exact"],
-            "status": ["exact"],
-        }
+        fields = [
+            "task_type",
+            "trigger_source",
+            "status",
+            "acknowledged",
+            "owner",
+            "name",
+            "result",
+        ]
+
+    def filter_name(self, queryset, name, value):
+        if not value:
+            return queryset
+
+        matching_task_types = [
+            task_type
+            for task_type, label in PaperlessTask.TaskType.choices
+            if value.lower() in str(label).lower()
+        ]
+        matching_trigger_sources = [
+            trigger_source
+            for trigger_source, label in PaperlessTask.TriggerSource.choices
+            if value.lower() in str(label).lower()
+        ]
+
+        return queryset.filter(
+            Q(input_data__filename__icontains=value)
+            | Q(task_type__in=matching_task_types)
+            | Q(trigger_source__in=matching_trigger_sources),
+        )
+
+    def filter_result(self, queryset, name, value):
+        if not value:
+            return queryset
+
+        query = Q(result_data__reason__icontains=value) | Q(
+            result_data__error_message__icontains=value,
+        )
+
+        try:
+            numeric_value = int(value)
+        except (TypeError, ValueError):
+            pass
+        else:
+            query |= Q(result_data__document_id=numeric_value) | Q(
+                result_data__duplicate_of=numeric_value,
+            )
+
+        if "duplicate" in value.lower():
+            query |= Q(result_data__duplicate_of__isnull=False)
+
+        return queryset.filter(query)
+
+    def filter_is_complete(self, queryset, name, value):
+        if value:
+            return queryset.filter(status__in=PaperlessTask.COMPLETE_STATUSES)
+        return queryset.exclude(status__in=PaperlessTask.COMPLETE_STATUSES)
 
 
-class ObjectOwnedOrGrantedPermissionsFilter(ObjectPermissionsFilter):
+class PermittedObjectsFilter(BaseFilterBackend):
     """
-    A filter backend that limits results to those where the requesting user
-    has read object level permissions, owns the objects, or objects without
-    an owner (for backwards compat)
+    Filters a queryset down to objects the requesting user owns, are
+    unowned, or (when ``include_granted`` is True) has an explicit
+    user/group guardian permission on. Backed by ``permitted_object_ids``
+    -- a single ``id__in`` subquery, not a join -- so it can't produce
+    duplicate rows even when the base queryset already carries independent
+    joins (e.g. multi-value ``tags__id__all`` filtering), and stays
+    index-friendly at scale instead of falling back to guardian's
+    varchar-cast join.
+
+    Set ``include_granted = False`` on a subclass for endpoints that
+    intentionally only show owned/unowned objects regardless of explicit
+    shares (e.g. ``TrashView``).
     """
+
+    include_granted: bool = True
+    perm_codename: str | None = None
 
     def filter_queryset(self, request, queryset, view):
-        objects_with_perms = super().filter_queryset(request, queryset, view)
-        objects_owned = queryset.filter(owner=request.user)
-        objects_unowned = queryset.filter(owner__isnull=True)
-        return objects_with_perms | objects_owned | objects_unowned
-
-
-class ObjectOwnedPermissionsFilter(ObjectPermissionsFilter):
-    """
-    A filter backend that limits results to those where the requesting user
-    owns the objects or objects without an owner (for backwards compat)
-    """
-
-    def filter_queryset(self, request, queryset, view):
+        # Before the superuser and owner-only paths, neither of which consults
+        # permitted_object_ids. Scoped to authenticated users so anonymous
+        # access (AnonymousUser.is_active is False) keeps its existing
+        # unowned-only behaviour.
+        if request.user.is_authenticated and not request.user.is_active:
+            return queryset.none()
         if request.user.is_superuser:
             return queryset
-        objects_owned = queryset.filter(owner=request.user)
-        objects_unowned = queryset.filter(owner__isnull=True)
-        return objects_owned | objects_unowned
+        if not self.include_granted:
+            return queryset.filter(Q(owner=request.user) | Q(owner__isnull=True))
+        model = queryset.model
+        perm = self.perm_codename or f"view_{model._meta.model_name}"
+        return queryset.filter(
+            id__in=permitted_object_ids(request.user, model, perm),
+        )
 
 
 class DocumentsOrderingFilter(OrderingFilter):

@@ -2,15 +2,19 @@ import hashlib
 import json
 import shutil
 import tempfile
+from datetime import timedelta
 from io import StringIO
 from pathlib import Path
 from unittest import mock
+from zipfile import ZIP_DEFLATED
+from zipfile import ZIP_LZMA
 from zipfile import ZipFile
 
 import pytest
 from allauth.socialaccount.models import SocialAccount
 from allauth.socialaccount.models import SocialApp
 from allauth.socialaccount.models import SocialToken
+from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import Permission
 from django.contrib.contenttypes.models import ContentType
@@ -31,6 +35,8 @@ from documents.models import CustomFieldInstance
 from documents.models import Document
 from documents.models import DocumentType
 from documents.models import Note
+from documents.models import ShareLink
+from documents.models import ShareLinkBundle
 from documents.models import StoragePath
 from documents.models import Tag
 from documents.models import User
@@ -39,6 +45,7 @@ from documents.models import WorkflowAction
 from documents.models import WorkflowTrigger
 from documents.sanity_checker import check_sanity
 from documents.settings import EXPORTER_FILE_NAME
+from documents.settings import EXPORTER_SHARE_LINK_BUNDLE_NAME
 from documents.tests.utils import DirectoriesMixin
 from documents.tests.utils import FileSystemAssertsMixin
 from documents.tests.utils import SampleDirMixin
@@ -63,8 +70,8 @@ class TestExportImport(
 
         self.d1 = Document.objects.create(
             content="Content",
-            checksum="42995833e01aea9b3edee44bbfdd7ce1",
-            archive_checksum="62acb0bcbfbcaa62ca6ad3668e4e404b",
+            checksum="1093cf6e32adbd16b06969df09215d42c4a3a8938cc18b39455953f08d1ff2ab",
+            archive_checksum="706124ecde3c31616992fa979caed17a726b1c9ccdba70e82a4ff796cea97ccf",
             title="wow1",
             filename="0000001.pdf",
             mime_type="application/pdf",
@@ -72,21 +79,21 @@ class TestExportImport(
         )
         self.d2 = Document.objects.create(
             content="Content",
-            checksum="9c9691e51741c1f4f41a20896af31770",
+            checksum="550d1bae0f746d4f7c6be07054eb20cc2f11988a58ef64ceae45e98f85e92a5b",
             title="wow2",
             filename="0000002.pdf",
             mime_type="application/pdf",
         )
         self.d3 = Document.objects.create(
             content="Content",
-            checksum="d38d7ed02e988e072caf924e0f3fcb76",
+            checksum="f1ba6b7ff8548214a75adec228f5468a14fe187f445bc0b9485cbf1c35b15915",
             title="wow2",
             filename="0000003.pdf",
             mime_type="application/pdf",
         )
         self.d4 = Document.objects.create(
             content="Content",
-            checksum="82186aaa94f0b98697d704b90fd1c072",
+            checksum="a81b16b6b313cfd7e60eb7b12598d1343b58622b4030cfa19a2724a02e98db1b",
             title="wow_dec",
             filename="0000004.pdf",
             mime_type="application/pdf",
@@ -239,7 +246,7 @@ class TestExportImport(
                 )
 
                 with Path(fname).open("rb") as f:
-                    checksum = hashlib.md5(f.read()).hexdigest()
+                    checksum = hashlib.sha256(f.read()).hexdigest()
                 self.assertEqual(checksum, element["fields"]["checksum"])
 
                 # Generated field "content_length" should not be exported,
@@ -253,7 +260,7 @@ class TestExportImport(
                     self.assertIsFile(fname)
 
                     with Path(fname).open("rb") as f:
-                        checksum = hashlib.md5(f.read()).hexdigest()
+                        checksum = hashlib.sha256(f.read()).hexdigest()
                     self.assertEqual(checksum, element["fields"]["archive_checksum"])
 
             elif element["model"] == "documents.note":
@@ -306,6 +313,108 @@ class TestExportImport(
         ):
             self.test_exporter(use_filename_format=True)
 
+    def test_exporter_includes_share_links_and_bundles(self) -> None:
+        shutil.rmtree(Path(self.dirs.media_dir) / "documents")
+        shutil.copytree(
+            Path(__file__).parent / "samples" / "documents",
+            Path(self.dirs.media_dir) / "documents",
+        )
+
+        share_link = ShareLink.objects.create(
+            slug="share-link-slug",
+            document=self.d1,
+            owner=self.user,
+            file_version=ShareLink.FileVersion.ORIGINAL,
+            expiration=timezone.now() + timedelta(days=7),
+        )
+
+        bundle_relative_path = Path("nested") / "share-bundle.zip"
+        bundle_source_path = settings.SHARE_LINK_BUNDLE_DIR / bundle_relative_path
+        bundle_source_path.parent.mkdir(parents=True, exist_ok=True)
+        bundle_source_path.write_bytes(b"share-bundle-contents")
+        bundle = ShareLinkBundle.objects.create(
+            slug="share-bundle-slug",
+            owner=self.user,
+            file_version=ShareLink.FileVersion.ARCHIVE,
+            expiration=timezone.now() + timedelta(days=7),
+            status=ShareLinkBundle.Status.READY,
+            size_bytes=bundle_source_path.stat().st_size,
+            file_path=str(bundle_relative_path),
+            built_at=timezone.now(),
+        )
+        bundle.documents.set([self.d1, self.d2])
+
+        manifest = self._do_export()
+
+        share_link_records = [
+            record for record in manifest if record["model"] == "documents.sharelink"
+        ]
+        self.assertEqual(len(share_link_records), 1)
+        self.assertEqual(share_link_records[0]["pk"], share_link.pk)
+        self.assertEqual(share_link_records[0]["fields"]["document"], self.d1.pk)
+        self.assertEqual(share_link_records[0]["fields"]["owner"], self.user.pk)
+
+        share_link_bundle_records = [
+            record
+            for record in manifest
+            if record["model"] == "documents.sharelinkbundle"
+        ]
+        self.assertEqual(len(share_link_bundle_records), 1)
+        bundle_record = share_link_bundle_records[0]
+        self.assertEqual(bundle_record["pk"], bundle.pk)
+        self.assertEqual(
+            bundle_record["fields"]["documents"],
+            [self.d1.pk, self.d2.pk],
+        )
+        self.assertEqual(
+            bundle_record[EXPORTER_SHARE_LINK_BUNDLE_NAME],
+            "share_link_bundles/nested/share-bundle.zip",
+        )
+        self.assertEqual(
+            bundle_record["fields"]["file_path"],
+            "nested/share-bundle.zip",
+        )
+        self.assertIsFile(self.target / bundle_record[EXPORTER_SHARE_LINK_BUNDLE_NAME])
+
+        with paperless_environment():
+            ShareLink.objects.all().delete()
+            ShareLinkBundle.objects.all().delete()
+            shutil.rmtree(settings.SHARE_LINK_BUNDLE_DIR, ignore_errors=True)
+
+            call_command(
+                "document_importer",
+                "--no-progress-bar",
+                self.target,
+                skip_checks=True,
+            )
+
+            imported_share_link = ShareLink.objects.get(pk=share_link.pk)
+            self.assertEqual(imported_share_link.document_id, self.d1.pk)
+            self.assertEqual(imported_share_link.owner_id, self.user.pk)
+            self.assertEqual(
+                imported_share_link.file_version,
+                ShareLink.FileVersion.ORIGINAL,
+            )
+
+            imported_bundle = ShareLinkBundle.objects.get(pk=bundle.pk)
+            imported_bundle_path = imported_bundle.absolute_file_path
+            self.assertEqual(imported_bundle.owner_id, self.user.pk)
+            self.assertEqual(
+                list(
+                    imported_bundle.documents.order_by("pk").values_list(
+                        "pk",
+                        flat=True,
+                    ),
+                ),
+                [self.d1.pk, self.d2.pk],
+            )
+            self.assertEqual(imported_bundle.file_path, "nested/share-bundle.zip")
+            self.assertIsNotNone(imported_bundle_path)
+            self.assertEqual(
+                imported_bundle_path.read_bytes(),
+                b"share-bundle-contents",
+            )
+
     def test_update_export_changed_time(self) -> None:
         shutil.rmtree(Path(self.dirs.media_dir) / "documents")
         shutil.copytree(
@@ -319,7 +428,7 @@ class TestExportImport(
         st_mtime_1 = (self.target / "manifest.json").stat().st_mtime
 
         with mock.patch(
-            "documents.management.commands.document_exporter.copy_file_with_basic_stats",
+            "documents.export.sinks.copy_file_with_basic_stats",
         ) as m:
             self._do_export()
             m.assert_not_called()
@@ -330,7 +439,7 @@ class TestExportImport(
         Path(self.d1.source_path).touch()
 
         with mock.patch(
-            "documents.management.commands.document_exporter.copy_file_with_basic_stats",
+            "documents.export.sinks.copy_file_with_basic_stats",
         ) as m:
             self._do_export()
             self.assertEqual(m.call_count, 1)
@@ -357,7 +466,7 @@ class TestExportImport(
         self.assertIsFile(self.target / "manifest.json")
 
         with mock.patch(
-            "documents.management.commands.document_exporter.copy_file_with_basic_stats",
+            "documents.export.sinks.copy_file_with_basic_stats",
         ) as m:
             self._do_export()
             m.assert_not_called()
@@ -368,7 +477,7 @@ class TestExportImport(
         self.d2.save()
 
         with mock.patch(
-            "documents.management.commands.document_exporter.copy_file_with_basic_stats",
+            "documents.export.sinks.copy_file_with_basic_stats",
         ) as m:
             self._do_export(compare_checksums=True)
             self.assertEqual(m.call_count, 1)
@@ -389,7 +498,7 @@ class TestExportImport(
         self.assertIsFile(
             str(self.target / doc_from_manifest[EXPORTER_FILE_NAME]),
         )
-        self.d3.delete()
+        self.d3.hard_delete()
 
         manifest = self._do_export()
         self.assertRaises(
@@ -868,6 +977,52 @@ class TestExportImport(
             for obj in manifest:
                 self.assertNotEqual(obj["model"], "auditlog.logentry")
 
+    def test_export_import_soft_deleted_document(self) -> None:
+        """
+        GIVEN:
+            - A document with a note and custom field instance has been soft-deleted
+        WHEN:
+            - Export and re-import are performed
+        THEN:
+            - The soft-deleted document, note, and custom field instance
+              survive the round-trip with deleted_at preserved
+        """
+        shutil.rmtree(Path(self.dirs.media_dir) / "documents")
+        shutil.copytree(
+            Path(__file__).parent / "samples" / "documents",
+            Path(self.dirs.media_dir) / "documents",
+        )
+
+        # d1 has self.note and self.cfi1 attached via setUp
+        self.d1.delete()
+
+        self._do_export()
+
+        with paperless_environment():
+            Document.global_objects.all().hard_delete()
+            Correspondent.objects.all().delete()
+            DocumentType.objects.all().delete()
+            Tag.objects.all().delete()
+
+            call_command(
+                "document_importer",
+                "--no-progress-bar",
+                self.target,
+                skip_checks=True,
+            )
+
+            self.assertEqual(Document.global_objects.count(), 4)
+            reimported_doc = Document.global_objects.get(pk=self.d1.pk)
+            self.assertIsNotNone(reimported_doc.deleted_at)
+
+            self.assertEqual(Note.global_objects.count(), 1)
+            reimported_note = Note.global_objects.get(pk=self.note.pk)
+            self.assertIsNotNone(reimported_note.deleted_at)
+
+            self.assertEqual(CustomFieldInstance.global_objects.count(), 1)
+            reimported_cfi = CustomFieldInstance.global_objects.get(pk=self.cfi1.pk)
+            self.assertIsNotNone(reimported_cfi.deleted_at)
+
     def test_export_data_only(self) -> None:
         """
         GIVEN:
@@ -904,6 +1059,217 @@ class TestExportImport(
         )
 
         self.assertEqual(Document.objects.all().count(), 4)
+
+    def test_zip_with_compare_flags_raises(self) -> None:
+        """
+        GIVEN:
+            - A request to export to a zip file
+        WHEN:
+            - --compare-checksums or --compare-json is also passed
+        THEN:
+            - A CommandError is raised (the flags are no-ops in zip mode)
+        """
+        for flag in ("--compare-checksums", "--compare-json"):
+            with self.subTest(flag=flag):
+                with self.assertRaises(CommandError):
+                    call_command(
+                        "document_exporter",
+                        self.target,
+                        "--zip",
+                        flag,
+                        skip_checks=True,
+                    )
+
+    def test_compression_flags_require_zip(self) -> None:
+        """
+        GIVEN:
+            - A request to export without --zip
+        WHEN:
+            - --zip-compression or --zip-compression-level is passed anyway
+        THEN:
+            - A CommandError is raised (the flags are meaningless without --zip)
+        """
+        cases = {
+            "zip-compression": ["--zip-compression", "lzma"],
+            "zip-compression-level": ["--zip-compression-level", "5"],
+        }
+        for case_id, args in cases.items():
+            with self.subTest(case_id), self.assertRaises(CommandError):
+                call_command(
+                    "document_exporter",
+                    self.target,
+                    *args,
+                    skip_checks=True,
+                )
+
+    def test_zip_compression_level_out_of_range_raises(self) -> None:
+        """
+        GIVEN:
+            - A request to export to a zip file
+        WHEN:
+            - --zip-compression-level is outside the chosen method's valid range
+        THEN:
+            - A CommandError is raised
+        """
+        with self.assertRaises(CommandError):
+            call_command(
+                "document_exporter",
+                self.target,
+                "--zip",
+                "--zip-compression",
+                "deflated",
+                "--zip-compression-level",
+                "99",
+                skip_checks=True,
+            )
+
+    def test_zip_compression_level_rejected_for_levelless_method(self) -> None:
+        """
+        GIVEN:
+            - A request to export to a zip file with a compression method
+              that ignores level entirely (stored, lzma)
+        WHEN:
+            - --zip-compression-level is also passed
+        THEN:
+            - A CommandError is raised
+        """
+        for method in ("stored", "lzma"):
+            with self.subTest(method), self.assertRaises(CommandError):
+                call_command(
+                    "document_exporter",
+                    self.target,
+                    "--zip",
+                    "--zip-compression",
+                    method,
+                    "--zip-compression-level",
+                    "5",
+                    skip_checks=True,
+                )
+
+    def test_zstd_unavailable_raises_friendly_error(self) -> None:
+        """
+        GIVEN:
+            - A Python runtime without zstd support (< 3.14)
+        WHEN:
+            - --zip-compression zstd is requested
+        THEN:
+            - A CommandError naming the Python version requirement is raised
+
+        zstd availability is mocked rather than relying on the actual
+        runtime: on a Python 3.14+ CI leg, ZSTD is not None, so without the
+        mock this check is skipped and the command falls through into the
+        real export, which fails on missing document files instead of
+        raising the expected CommandError.
+        """
+        with (
+            mock.patch(
+                "documents.management.commands.document_exporter.ZSTD",
+                None,
+            ),
+            mock.patch(
+                "documents.management.commands.document_exporter.compression_available",
+                return_value=False,
+            ),
+            self.assertRaises(CommandError) as e,
+        ):
+            call_command(
+                "document_exporter",
+                self.target,
+                "--zip",
+                "--zip-compression",
+                "zstd",
+                skip_checks=True,
+            )
+        self.assertIn("3.14", str(e.exception))
+
+    def test_non_zstd_unavailable_raises_generic_error(self) -> None:
+        """
+        GIVEN:
+            - A Python runtime missing the module backing a non-zstd method
+              (e.g. bz2/lzma not compiled in on a minimal build)
+        WHEN:
+            - That method is requested via --zip-compression
+        THEN:
+            - A CommandError is raised naming the method, not the
+              zstd-specific "requires 3.14" message
+        """
+        with (
+            mock.patch(
+                "documents.management.commands.document_exporter.compression_available",
+                return_value=False,
+            ),
+            self.assertRaises(CommandError) as e,
+        ):
+            call_command(
+                "document_exporter",
+                self.target,
+                "--zip",
+                "--zip-compression",
+                "bzip2",
+                skip_checks=True,
+            )
+        self.assertIn("bzip2", str(e.exception))
+        self.assertNotIn("3.14", str(e.exception))
+
+    def test_zip_compression_flag_resolves_to_sink_constant(self) -> None:
+        """
+        GIVEN:
+            - A request to export to a zip file with --zip-compression lzma
+        WHEN:
+            - The export runs
+        THEN:
+            - ZipExportSink is constructed with the resolved ZIP_LZMA constant
+              (whether zipfile actually compresses with the chosen method is
+              Python's own contract, and ZipExportSink's own tests already
+              cover the forwarding; what this command owns is resolving the
+              CLI string to the right constant, so assert that resolution
+              directly)
+        """
+        with mock.patch(
+            "documents.management.commands.document_exporter.ZipExportSink",
+        ) as sink_cls:
+            call_command(
+                "document_exporter",
+                self.target,
+                "--zip",
+                "--zip-compression",
+                "lzma",
+                skip_checks=True,
+            )
+        sink_cls.assert_called_once_with(
+            mock.ANY,
+            mock.ANY,
+            delete=False,
+            compression=ZIP_LZMA,
+            compresslevel=None,
+        )
+
+    def test_default_zip_compression_resolves_to_deflate(self) -> None:
+        """
+        GIVEN:
+            - A request to export to a zip file with no --zip-compression flag
+        WHEN:
+            - The export runs
+        THEN:
+            - ZipExportSink is constructed with the default ZIP_DEFLATED
+              constant and compresslevel=None, matching pre-existing behavior
+        """
+        with mock.patch(
+            "documents.management.commands.document_exporter.ZipExportSink",
+        ) as sink_cls:
+            call_command(
+                "document_exporter",
+                self.target,
+                "--zip",
+                skip_checks=True,
+            )
+        sink_cls.assert_called_once_with(
+            mock.ANY,
+            mock.ANY,
+            delete=False,
+            compression=ZIP_DEFLATED,
+            compresslevel=None,
+        )
 
 
 @pytest.mark.management

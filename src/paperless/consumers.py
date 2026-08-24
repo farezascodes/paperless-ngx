@@ -1,16 +1,34 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
 import json
-from typing import Any
+from typing import TYPE_CHECKING
 
 from channels.generic.websocket import AsyncWebsocketConsumer
 
+if TYPE_CHECKING:
+    from django.contrib.auth.base_user import AbstractBaseUser
+    from django.contrib.auth.models import AnonymousUser
+
+    from documents.plugins.helpers import DocumentsDeletedPayload
+    from documents.plugins.helpers import DocumentUpdatedPayload
+    from documents.plugins.helpers import PermissionsData
+    from documents.plugins.helpers import StatusUpdatePayload
+
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_MESSAGE = json.dumps({"type": "heartbeat"})
+
 
 class StatusConsumer(AsyncWebsocketConsumer):
+    heartbeat_task: asyncio.Task | None = None
+
     def _authenticated(self) -> bool:
-        user: Any = self.scope.get("user")
+        user: AbstractBaseUser | AnonymousUser | None = self.scope.get("user")
         return user is not None and user.is_authenticated
 
-    async def _can_view(self, data: dict[str, Any]) -> bool:
-        user: Any = self.scope.get("user")
+    async def _can_view(self, data: PermissionsData) -> bool:
+        user: AbstractBaseUser | AnonymousUser | None = self.scope.get("user")
         if user is None:
             return False
         owner_id = data.get("owner_id")
@@ -28,23 +46,40 @@ class StatusConsumer(AsyncWebsocketConsumer):
             return
         await self.channel_layer.group_add("status_updates", self.channel_name)
         await self.accept()
+        self._start_heartbeat()
 
     async def disconnect(self, code: int) -> None:
+        await self._stop_heartbeat()
         await self.channel_layer.group_discard("status_updates", self.channel_name)
 
-    async def status_update(self, event: dict[str, Any]) -> None:
+    def _start_heartbeat(self) -> None:
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _stop_heartbeat(self) -> None:
+        if self.heartbeat_task is not None:
+            self.heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.heartbeat_task
+            self.heartbeat_task = None
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await self.send(HEARTBEAT_MESSAGE)
+
+    async def status_update(self, event: StatusUpdatePayload) -> None:
         if not self._authenticated():
             await self.close()
         elif await self._can_view(event["data"]):
             await self.send(json.dumps(event))
 
-    async def documents_deleted(self, event: dict[str, Any]) -> None:
+    async def documents_deleted(self, event: DocumentsDeletedPayload) -> None:
         if not self._authenticated():
             await self.close()
         else:
             await self.send(json.dumps(event))
 
-    async def document_updated(self, event: dict[str, Any]) -> None:
+    async def document_updated(self, event: DocumentUpdatedPayload) -> None:
         if not self._authenticated():
             await self.close()
         elif await self._can_view(event["data"]):

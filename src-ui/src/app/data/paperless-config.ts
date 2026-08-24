@@ -11,16 +11,16 @@ export enum OutputTypeConfig {
 }
 
 export enum ModeConfig {
-  SKIP = 'skip',
-  REDO = 'redo',
+  AUTO = 'auto',
   FORCE = 'force',
-  SKIP_NO_ARCHIVE = 'skip_noarchive',
+  REDO = 'redo',
+  OFF = 'off',
 }
 
 export enum ArchiveFileConfig {
-  NEVER = 'never',
-  WITH_TEXT = 'with_text',
+  AUTO = 'auto',
   ALWAYS = 'always',
+  NEVER = 'never',
 }
 
 export enum CleanConfig {
@@ -55,12 +55,13 @@ export const ConfigCategory = {
 }
 
 export const LLMEmbeddingBackendConfig = {
-  OPENAI: 'openai',
+  OPENAI_LIKE: 'openai-like',
   HUGGINGFACE: 'huggingface',
+  OLLAMA: 'ollama',
 }
 
 export const LLMBackendConfig = {
-  OPENAI: 'openai',
+  OPENAI_LIKE: 'openai-like',
   OLLAMA: 'ollama',
 }
 
@@ -115,11 +116,11 @@ export const PaperlessConfigOptions: ConfigOption[] = [
     category: ConfigCategory.OCR,
   },
   {
-    key: 'skip_archive_file',
-    title: $localize`Skip Archive File`,
+    key: 'archive_file_generation',
+    title: $localize`Archive File Generation`,
     type: ConfigOptionType.Select,
     choices: mapToItems(ArchiveFileConfig),
-    config_key: 'PAPERLESS_OCR_SKIP_ARCHIVE_FILE',
+    config_key: 'PAPERLESS_ARCHIVE_FILE_GENERATION',
     category: ConfigCategory.OCR,
   },
   {
@@ -302,6 +303,27 @@ export const PaperlessConfigOptions: ConfigOption[] = [
     category: ConfigCategory.AI,
   },
   {
+    key: 'llm_embedding_endpoint',
+    title: $localize`LLM Embedding Endpoint`,
+    type: ConfigOptionType.String,
+    config_key: 'PAPERLESS_AI_LLM_EMBEDDING_ENDPOINT',
+    category: ConfigCategory.AI,
+  },
+  {
+    key: 'llm_embedding_chunk_size',
+    title: $localize`LLM Embedding Chunk Size`,
+    type: ConfigOptionType.Number,
+    config_key: 'PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE',
+    category: ConfigCategory.AI,
+  },
+  {
+    key: 'llm_context_size',
+    title: $localize`LLM Context Size`,
+    type: ConfigOptionType.Number,
+    config_key: 'PAPERLESS_AI_LLM_CONTEXT_SIZE',
+    category: ConfigCategory.AI,
+  },
+  {
     key: 'llm_backend',
     title: $localize`LLM Backend`,
     type: ConfigOptionType.Select,
@@ -330,6 +352,22 @@ export const PaperlessConfigOptions: ConfigOption[] = [
     config_key: 'PAPERLESS_AI_LLM_ENDPOINT',
     category: ConfigCategory.AI,
   },
+  {
+    key: 'llm_output_language',
+    title: $localize`LLM Output Language`,
+    type: ConfigOptionType.String,
+    config_key: 'PAPERLESS_AI_LLM_OUTPUT_LANGUAGE',
+    category: ConfigCategory.AI,
+    note: $localize`Language to use for generated AI suggestions. When unset, AI suggestions use the user's display language if explicitly set.`,
+  },
+  {
+    key: 'llm_request_timeout',
+    title: $localize`LLM Request Timeout`,
+    type: ConfigOptionType.Number,
+    config_key: 'PAPERLESS_AI_LLM_REQUEST_TIMEOUT',
+    category: ConfigCategory.AI,
+    note: $localize`Timeout in seconds for LLM requests.`,
+  },
 ]
 
 export interface PaperlessConfig extends ObjectWithId {
@@ -337,7 +375,7 @@ export interface PaperlessConfig extends ObjectWithId {
   pages: number
   language: string
   mode: ModeConfig
-  skip_archive_file: ArchiveFileConfig
+  archive_file_generation: ArchiveFileConfig
   image_dpi: number
   unpaper_clean: CleanConfig
   deskew: boolean
@@ -363,8 +401,13 @@ export interface PaperlessConfig extends ObjectWithId {
   ai_enabled: boolean
   llm_embedding_backend: string
   llm_embedding_model: string
+  llm_embedding_endpoint: string
+  llm_embedding_chunk_size: number
+  llm_context_size: number
   llm_backend: string
   llm_model: string
   llm_api_key: string
   llm_endpoint: string
+  llm_output_language: string
+  llm_request_timeout: number
 }

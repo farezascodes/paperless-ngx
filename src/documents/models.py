@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import Final
 
 import pathvalidate
-from celery import states
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import User
@@ -216,14 +215,15 @@ class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-
 
     checksum = models.CharField(
         _("checksum"),
-        max_length=32,
+        max_length=64,
         editable=False,
+        db_index=True,
         help_text=_("The checksum of the original document."),
     )
 
     archive_checksum = models.CharField(
         _("archive checksum"),
-        max_length=32,
+        max_length=64,
         editable=False,
         blank=True,
         null=True,
@@ -235,7 +235,7 @@ class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-
         blank=False,
         null=True,
         unique=False,
-        db_index=False,
+        db_index=True,
         validators=[MinValueValidator(1)],
         help_text=_(
             "The number of pages of the document.",
@@ -339,6 +339,9 @@ class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-
         ordering = ("-created",)
         verbose_name = _("document")
         verbose_name_plural = _("documents")
+        indexes = [
+            models.Index(fields=["owner", "created"]),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["root_document", "version_index"],
@@ -369,6 +372,10 @@ class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-
         For version documents, this is always the document's own content.
         If the queryset already annotated ``effective_content``, that value is used.
         """
+        # Here to avoid circular import
+        from documents.versioning import sort_versions_newest_first
+        from documents.versioning import versions_newest_first
+
         if hasattr(self, "effective_content"):
             return getattr(self, "effective_content")
 
@@ -381,13 +388,14 @@ class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-
             if isinstance(prefetched_cache, dict)
             else None
         )
-        if prefetched_versions:
-            latest_prefetched = max(prefetched_versions, key=lambda doc: doc.id)
-            return latest_prefetched.content
+        if prefetched_versions is not None:
+            # Empty list means prefetch ran and found no versions — use own content.
+            if not prefetched_versions:
+                return self.content
+            return sort_versions_newest_first(prefetched_versions)[0].content
 
         latest_version_content = (
-            Document.objects.filter(root_document=self)
-            .order_by("-id")
+            versions_newest_first(Document.objects.filter(root_document=self))
             .values_list("content", flat=True)
             .first()
         )
@@ -513,6 +521,68 @@ class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-
 
 
 class SavedView(ModelWithOwner):
+    class Icon(models.TextChoices):
+        ARCHIVE = ("archive", _("Archive"))
+        BANK = ("bank", _("Bank"))
+        BASKET = ("basket", _("Basket"))
+        BELL = ("bell", _("Bell"))
+        BOOKMARK = ("bookmark", _("Bookmark"))
+        BOXES = ("boxes", _("Boxes"))
+        BRIEFCASE = ("briefcase", _("Briefcase"))
+        BUILDING = ("building", _("Building"))
+        CALCULATOR = ("calculator", _("Calculator"))
+        CALENDAR = ("calendar", _("Calendar"))
+        CAMERA = ("camera", _("Camera"))
+        CARD_CHECKLIST = ("card-checklist", _("Checklist"))
+        CASH = ("cash", _("Cash"))
+        CHAT_LEFT_TEXT = ("chat-left-text", _("Chat"))
+        CHECK_CIRCLE = ("check-circle", _("Check"))
+        CLIPBOARD = ("clipboard", _("Clipboard"))
+        CLOCK_HISTORY = ("clock-history", _("Clock"))
+        CREDIT_CARD = ("credit-card", _("Credit card"))
+        DOWNLOAD = ("download", _("Download"))
+        ENVELOPE = ("envelope", _("Envelope"))
+        EXCLAMATION_TRIANGLE = ("exclamation-triangle", _("Warning"))
+        FILE_EARMARK = ("file-earmark", _("File"))
+        FILE_EARMARK_CHECK = ("file-earmark-check", _("Checked file"))
+        FILE_EARMARK_LOCK = ("file-earmark-lock", _("Locked file"))
+        FILE_EARMARK_MEDICAL = ("file-earmark-medical", _("Medical file"))
+        FILE_EARMARK_PERSON = ("file-earmark-person", _("Person file"))
+        FILE_EARMARK_SPREADSHEET = (
+            "file-earmark-spreadsheet",
+            _("Spreadsheet"),
+        )
+        FILE_TEXT = ("file-text", _("Text file"))
+        FILES = ("files", _("Files"))
+        FOLDER = ("folder", _("Folder"))
+        FUNNEL = ("funnel", _("Filter"))
+        GEAR = ("gear", _("Gear"))
+        GLOBE = ("globe2", _("Globe"))
+        HASH = ("hash", _("Hash"))
+        HEART = ("heart", _("Heart"))
+        HOUSE = ("house", _("House"))
+        INBOX = ("inbox", _("Inbox"))
+        JOURNALS = ("journals", _("Journals"))
+        LIST_TASK = ("list-task", _("Task list"))
+        NEWSPAPER = ("newspaper", _("Newspaper"))
+        PAPERCLIP = ("paperclip", _("Attachment"))
+        PEOPLE = ("people", _("People"))
+        PERSON = ("person", _("Person"))
+        PRINTER = ("printer", _("Printer"))
+        RECEIPT = ("receipt", _("Receipt"))
+        SAFE = ("safe", _("Safe"))
+        SEARCH = ("search", _("Search"))
+        SEND = ("send", _("Send"))
+        SHOP = ("shop", _("Shop"))
+        STACK = ("stack", _("Stack"))
+        STARS = ("stars", _("Stars"))
+        TAG = ("tag", _("Tag"))
+        TAGS = ("tags", _("Tags"))
+        TELEPHONE = ("telephone", _("Telephone"))
+        TRUCK = ("truck", _("Truck"))
+        UPC_SCAN = ("upc-scan", _("Barcode"))
+        WALLET = ("wallet2", _("Wallet"))
+
     class DisplayMode(models.TextChoices):
         TABLE = ("table", _("Table"))
         SMALL_CARDS = ("smallCards", _("Small Cards"))
@@ -534,6 +604,13 @@ class SavedView(ModelWithOwner):
         CUSTOM_FIELD = ("custom_field_%d", ("Custom Field"))
 
     name = models.CharField(_("name"), max_length=128)
+
+    icon = models.CharField(
+        _("icon"),
+        max_length=64,
+        choices=Icon.choices,
+        default=Icon.FUNNEL,
+    )
 
     sort_field = models.CharField(
         _("sort field"),
@@ -623,6 +700,8 @@ class SavedViewFilterRule(models.Model):
         (45, _("added to")),
         (46, _("added from")),
         (47, _("mime type is")),
+        (48, _("simple title search")),
+        (49, _("simple text search")),
     ]
 
     saved_view = models.ForeignKey(
@@ -658,97 +737,167 @@ class UiSettings(models.Model):
 
 
 class PaperlessTask(ModelWithOwner):
-    ALL_STATES = sorted(states.ALL_STATES)
-    TASK_STATE_CHOICES = sorted(zip(ALL_STATES, ALL_STATES))
+    """
+    Tracks background task execution for user visibility and debugging.
+
+    State transitions:
+        PENDING -> STARTED -> SUCCESS
+        PENDING -> STARTED -> FAILURE
+        PENDING -> REVOKED (if cancelled before starting)
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        STARTED = "started", _("Started")
+        SUCCESS = "success", _("Success")
+        FAILURE = "failure", _("Failure")
+        REVOKED = "revoked", _("Revoked")
 
     class TaskType(models.TextChoices):
-        AUTO = ("auto_task", _("Auto Task"))
-        SCHEDULED_TASK = ("scheduled_task", _("Scheduled Task"))
-        MANUAL_TASK = ("manual_task", _("Manual Task"))
+        CONSUME_FILE = "consume_file", _("Consume File")
+        TRAIN_CLASSIFIER = "train_classifier", _("Train Classifier")
+        SANITY_CHECK = "sanity_check", _("Sanity Check")
+        INDEX_OPTIMIZE = "index_optimize", _("Index Optimize")
+        MAIL_FETCH = "mail_fetch", _("Mail Fetch")
+        LLM_INDEX = "llm_index", _("LLM Index")
+        EMPTY_TRASH = "empty_trash", _("Empty Trash")
+        CHECK_WORKFLOWS = "check_workflows", _("Check Workflows")
+        BULK_UPDATE = "bulk_update", _("Bulk Update")
+        REPROCESS_DOCUMENT = "reprocess_document", _("Reprocess Document")
+        BUILD_SHARE_LINK = "build_share_link", _("Build Share Link")
+        BULK_DELETE = "bulk_delete", _("Bulk Delete")
 
-    class TaskName(models.TextChoices):
-        CONSUME_FILE = ("consume_file", _("Consume File"))
-        TRAIN_CLASSIFIER = ("train_classifier", _("Train Classifier"))
-        CHECK_SANITY = ("check_sanity", _("Check Sanity"))
-        INDEX_OPTIMIZE = ("index_optimize", _("Index Optimize"))
-        LLMINDEX_UPDATE = ("llmindex_update", _("LLM Index Update"))
+    COMPLETE_STATUSES = (
+        Status.SUCCESS,
+        Status.FAILURE,
+        Status.REVOKED,
+    )
 
+    class TriggerSource(models.TextChoices):
+        SCHEDULED = "scheduled", _("Scheduled")  # Celery beat
+        WEB_UI = "web_ui", _("Web UI")  # Document uploaded via web
+        API_UPLOAD = "api_upload", _("API Upload")  # Document uploaded via API
+        FOLDER_CONSUME = "folder_consume", _("Folder Consume")  # Consume folder
+        EMAIL_CONSUME = "email_consume", _("Email Consume")  # Email attachment
+        SYSTEM = "system", _("System")  # Auto-triggered (self-heal, config side-effect)
+        MANUAL = "manual", _("Manual")  # User explicitly ran via /api/tasks/run/
+
+    # Identification
     task_id = models.CharField(
-        max_length=255,
+        max_length=72,
         unique=True,
         verbose_name=_("Task ID"),
-        help_text=_("Celery ID for the Task that was run"),
+        help_text=_("Celery task ID"),
     )
 
-    acknowledged = models.BooleanField(
-        default=False,
-        verbose_name=_("Acknowledged"),
-        help_text=_("If the task is acknowledged via the frontend or API"),
+    task_type = models.CharField(
+        max_length=50,
+        choices=TaskType.choices,
+        verbose_name=_("Task Type"),
+        help_text=_("The kind of work being performed"),
+        db_index=True,
     )
 
-    task_file_name = models.CharField(
-        null=True,
-        max_length=255,
-        verbose_name=_("Task Filename"),
-        help_text=_("Name of the file which the Task was run for"),
+    trigger_source = models.CharField(
+        max_length=50,
+        choices=TriggerSource.choices,
+        verbose_name=_("Trigger Source"),
+        help_text=_("What initiated this task"),
+        db_index=True,
     )
 
-    task_name = models.CharField(
-        null=True,
-        max_length=255,
-        choices=TaskName.choices,
-        verbose_name=_("Task Name"),
-        help_text=_("Name of the task that was run"),
-    )
-
+    # State tracking
     status = models.CharField(
         max_length=30,
-        default=states.PENDING,
-        choices=TASK_STATE_CHOICES,
-        verbose_name=_("Task State"),
-        help_text=_("Current state of the task being run"),
+        choices=Status.choices,
+        default=Status.PENDING,
+        verbose_name=_("Status"),
+        db_index=True,
     )
 
+    # Timestamps
     date_created = models.DateTimeField(
-        null=True,
         default=timezone.now,
-        verbose_name=_("Created DateTime"),
-        help_text=_("Datetime field when the task result was created in UTC"),
+        verbose_name=_("Created"),
+        db_index=True,
     )
 
     date_started = models.DateTimeField(
         null=True,
-        default=None,
-        verbose_name=_("Started DateTime"),
-        help_text=_("Datetime field when the task was started in UTC"),
+        blank=True,
+        verbose_name=_("Started"),
     )
 
     date_done = models.DateTimeField(
         null=True,
-        default=None,
-        verbose_name=_("Completed DateTime"),
-        help_text=_("Datetime field when the task was completed in UTC"),
+        blank=True,
+        verbose_name=_("Completed"),
+        db_index=True,
     )
 
-    result = models.TextField(
+    # Duration fields -- populated by task_postrun signal handler
+    duration_seconds = models.FloatField(
         null=True,
-        default=None,
+        blank=True,
+        verbose_name=_("Duration (seconds)"),
+        help_text=_("Elapsed time from start to completion"),
+    )
+
+    wait_time_seconds = models.FloatField(
+        null=True,
+        blank=True,
+        verbose_name=_("Wait Time (seconds)"),
+        help_text=_("Time from task creation to worker pickup"),
+    )
+
+    # Input/Output data
+    input_data = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name=_("Input Data"),
+        help_text=_("Structured input parameters for the task"),
+    )
+
+    result_data = models.JSONField(
+        null=True,
+        blank=True,
         verbose_name=_("Result Data"),
-        help_text=_(
-            "The data returned by the task",
-        ),
+        help_text=_("Structured result data from task execution"),
     )
 
-    type = models.CharField(
-        max_length=30,
-        choices=TaskType.choices,
-        default=TaskType.AUTO,
-        verbose_name=_("Task Type"),
-        help_text=_("The type of task that was run"),
+    # Acknowledgment
+    acknowledged = models.BooleanField(
+        default=False,
+        verbose_name=_("Acknowledged"),
+        db_index=True,
     )
 
-    def __str__(self) -> str:
-        return f"Task {self.task_id}"
+    class Meta:
+        verbose_name = _("Task")
+        verbose_name_plural = _("Tasks")
+        ordering = ["-date_created"]
+        indexes = [
+            models.Index(fields=["status", "date_created"]),
+            models.Index(fields=["task_type", "status"]),
+            models.Index(fields=["owner", "acknowledged", "date_created"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.get_task_type_display()} [{self.task_id[:8]}]"
+
+    @property
+    def is_complete(self) -> bool:  # pragma: no cover
+        return self.status in self.COMPLETE_STATUSES
+
+    @property
+    def related_document_ids(self) -> list[int]:  # pragma: no cover
+        if not self.result_data:
+            return []
+        if doc_id := self.result_data.get("document_id"):
+            return [doc_id]
+        if dup_id := self.result_data.get("duplicate_of"):
+            return [dup_id]
+        return []
 
 
 class Note(SoftDeleteModel):
@@ -945,7 +1094,17 @@ class ShareLinkBundle(models.Model):
     def absolute_file_path(self) -> Path | None:
         if not self.file_path:
             return None
-        return (settings.SHARE_LINK_BUNDLE_DIR / Path(self.file_path)).resolve()
+        relative_path = Path(self.file_path)
+        if relative_path.is_absolute():
+            return None
+
+        bundle_dir = settings.SHARE_LINK_BUNDLE_DIR.resolve()
+        absolute_path = (bundle_dir / relative_path).resolve()
+        try:
+            absolute_path.relative_to(bundle_dir)
+        except ValueError:
+            return None
+        return absolute_path
 
     def remove_file(self) -> None:
         if self.absolute_file_path is not None and self.absolute_file_path.exists():
@@ -1106,6 +1265,12 @@ class CustomFieldInstance(SoftDeleteModel):
         ordering = ("created",)
         verbose_name = _("custom field instance")
         verbose_name_plural = _("custom field instances")
+        indexes = [
+            models.Index(fields=["field", "value_date"]),
+            models.Index(fields=["field", "value_int"]),
+            models.Index(fields=["field", "value_float"]),
+            models.Index(fields=["field", "value_monetary_amount"]),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["document", "field"],
@@ -1114,19 +1279,7 @@ class CustomFieldInstance(SoftDeleteModel):
         ]
 
     def __str__(self) -> str:
-        value = (
-            next(
-                option.get("label")
-                for option in self.field.extra_data["select_options"]
-                if option.get("id") == self.value_select
-            )
-            if (
-                self.field.data_type == CustomField.FieldDataType.SELECT
-                and self.value_select is not None
-            )
-            else self.value
-        )
-        return str(self.field.name) + f" : {value}"
+        return str(self.field.name) + f" : {self.value_for_search}"
 
     @classmethod
     def get_value_field_name(cls, data_type: CustomField.FieldDataType):
@@ -1143,6 +1296,25 @@ class CustomFieldInstance(SoftDeleteModel):
         """
         value_field_name = self.get_value_field_name(self.field.data_type)
         return getattr(self, value_field_name)
+
+    @property
+    def value_for_search(self) -> str | None:
+        """
+        Return the value suitable for full-text indexing and display, or None
+        if the value is unset.
+
+        For SELECT fields, resolves the human-readable label rather than the
+        opaque option ID stored in value_select.
+        """
+        if self.value is None:
+            return None
+        if self.field.data_type == CustomField.FieldDataType.SELECT:
+            options = (self.field.extra_data or {}).get("select_options", [])
+            return next(
+                (o["label"] for o in options if o.get("id") == self.value),
+                None,
+            )
+        return str(self.value)
 
 
 if settings.AUDIT_LOG_ENABLED:
@@ -1334,7 +1506,7 @@ class WorkflowTrigger(models.Model):
         help_text=_("JSON-encoded custom field query expression."),
     )
 
-    schedule_offset_days = models.SmallIntegerField(
+    schedule_offset_days = models.IntegerField(
         _("schedule offset days"),
         default=0,
         help_text=_(
@@ -1350,7 +1522,7 @@ class WorkflowTrigger(models.Model):
         ),
     )
 
-    schedule_recurring_interval_days = models.PositiveSmallIntegerField(
+    schedule_recurring_interval_days = models.PositiveIntegerField(
         _("schedule recurring delay in days"),
         default=1,
         validators=[MinValueValidator(1)],
@@ -1505,7 +1677,7 @@ class WorkflowAction(models.Model):
         default=WorkflowActionType.ASSIGNMENT,
     )
 
-    order = models.PositiveSmallIntegerField(_("order"), default=0)
+    order = models.PositiveIntegerField(_("order"), default=0)
 
     assign_title = models.TextField(
         _("assign title"),
@@ -1747,7 +1919,7 @@ class WorkflowAction(models.Model):
 class Workflow(models.Model):
     name = models.CharField(_("name"), max_length=256, unique=True)
 
-    order = models.SmallIntegerField(_("order"), default=0)
+    order = models.IntegerField(_("order"), default=0)
 
     triggers = models.ManyToManyField(
         WorkflowTrigger,

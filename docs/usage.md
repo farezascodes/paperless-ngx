@@ -99,6 +99,10 @@ Think of versions as **file history** for a document.
 - By default, search and document content use the latest version.
 - In document detail, selecting a version switches the preview, file metadata and content (and download etc buttons) to that version.
 - Deleting a non-root version keeps metadata and falls back to the latest remaining version.
+- From the document list, select two or more documents and choose **Merge as versions** to combine them under one entry. Select the root document whose metadata and permissions should be retained; the other selected documents become file versions. The root may already have versions, but documents being added as versions must not have version histories of their own.
+- From a document's **Versions** menu, choose **Existing** to search for another document and add it as a version of the current document.
+- Documents merged as versions give up their archive serial number. If the root has no ASN of its own it takes the first one, otherwise the ASNs are released and the removal is logged.
+- Merging as versions cannot be undone from the UI, and deleting the root document moves its versions to the trash as well.
 
 ### Management Lists
 
@@ -134,9 +138,9 @@ following operations on your documents:
 !!! tip
 
     This process can be configured to fit your needs. If you don't want
-    paperless to create archived versions for digital documents, you can
-    configure that by configuring
-    `PAPERLESS_OCR_SKIP_ARCHIVE_FILE=with_text`. Please read the
+    paperless to create archived versions for born-digital documents, set
+    [`PAPERLESS_ARCHIVE_FILE_GENERATION=auto`](configuration.md#PAPERLESS_ARCHIVE_FILE_GENERATION)
+    (the default). To skip archives entirely, use `never`. Please read the
     [relevant section in the documentation](configuration.md#ocr).
 
 !!! note
@@ -292,6 +296,23 @@ Once setup, navigating to the email settings page in Paperless-ngx will allow yo
 You can also submit a document using the REST API, see [POSTing documents](api.md#file-uploads)
 for details.
 
+### Duplicate documents
+
+By default, Paperless-ngx **does not reject duplicates**. If you consume a file whose
+contents exactly match an existing document (same checksum), the new copy is still
+consumed and a warning is logged. The task entry for the upload also flags that a
+duplicate was detected and links to the existing document(s).
+
+To review duplicates, open a document and switch to the **Duplicates** tab on the
+document detail page. It lists other documents that share the same content, including any
+that are in the trash (shown with a badge), and links to each so you can decide which to
+keep.
+
+If you would rather reject duplicates at consumption time (the pre-v3 behavior), set
+[`PAPERLESS_CONSUMER_DELETE_DUPLICATES`](configuration.md#PAPERLESS_CONSUMER_DELETE_DUPLICATES)
+to `true`. The duplicate file is then deleted instead of consumed, and the task fails with
+a "document already exists" message.
+
 ## Document Suggestions
 
 Paperless-ngx can suggest tags, correspondents, document types and storage paths for documents based on the content of the document. This is done using a (non-LLM) machine learning model that is trained on the documents in your database. The suggestions are shown in the document detail page and can be accepted or rejected by the user.
@@ -302,13 +323,21 @@ Paperless-ngx includes several features that use AI to enhance the document mana
 
 !!! warning
 
-    Remember that Paperless-ngx will send document content to the AI provider you have configured, so consider the privacy implications of using these features, especially if using a remote model (e.g. OpenAI), instead of the default local model.
+    Remember that Paperless-ngx will send document content to the AI provider you have configured,
+    so consider the privacy implications of using these features, especially if using a remote
+    model or API provider instead of the default local model.
 
-The AI features work by creating an embedding of the text content and metadata of documents, which is then used for various tasks such as similarity search and question answering. This uses the FAISS vector store.
+The AI features work by creating an embedding of the text content and metadata of documents, which is then used for various tasks such as similarity search and question answering.
+
+See [AI features](advanced_usage.md#ai-features) for how to enable and configure these features, including choosing an LLM backend and setting up the LLM index for RAG.
 
 ### AI-Enhanced Suggestions
 
-If enabled, Paperless-ngx can use an AI LLM model to suggest document titles, dates, tags, correspondents and document types for documents. This feature will always be "opt-in" and does not disable the existing classifier-based suggestion system. Currently, both remote (via the OpenAI API) and local (via Ollama) models are supported, see [configuration](configuration.md#ai) for details.
+If enabled, Paperless-ngx can use an AI LLM model to suggest document titles, dates, tags,
+correspondents and document types for documents. This feature will always be "opt-in" and does not
+disable the existing classifier-based suggestion system. Currently, both remote
+(via OpenAI-compatible APIs) and local (via Ollama) models are supported, see
+[configuration](configuration.md#ai) for details.
 
 ### Document Chat
 
@@ -398,25 +427,27 @@ Global permissions define what areas of the app and API endpoints users can acce
 determine if a user can create, edit, delete or view _any_ documents, but individual documents themselves
 still have "object-level" permissions.
 
-| Type          | Details                                                                                                                                                                                                                         |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| AppConfig     | _Change_ or higher permissions grants access to the "Application Configuration" area.                                                                                                                                           |
-| Correspondent | Add, edit, delete or view Correspondents.                                                                                                                                                                                       |
-| CustomField   | Add, edit, delete or view Custom Fields.                                                                                                                                                                                        |
-| Document      | Add, edit, delete or view Documents.                                                                                                                                                                                            |
-| DocumentType  | Add, edit, delete or view Document Types.                                                                                                                                                                                       |
-| Group         | Add, edit, delete or view Groups.                                                                                                                                                                                               |
-| MailAccount   | Add, edit, delete or view Mail Accounts.                                                                                                                                                                                        |
-| MailRule      | Add, edit, delete or view Mail Rules.                                                                                                                                                                                           |
-| Note          | Add, edit, delete or view Notes.                                                                                                                                                                                                |
-| PaperlessTask | View or dismiss (_Change_) File Tasks.                                                                                                                                                                                          |
-| SavedView     | Add, edit, delete or view Saved Views.                                                                                                                                                                                          |
-| ShareLink     | Add, delete or view Share Links.                                                                                                                                                                                                |
-| StoragePath   | Add, edit, delete or view Storage Paths.                                                                                                                                                                                        |
-| Tag           | Add, edit, delete or view Tags.                                                                                                                                                                                                 |
-| UISettings    | Add, edit, delete or view the UI settings that are used by the web app.<br/>:warning: **Users that will access the web UI must be granted at least _View_ permissions.**                                                        |
-| User          | Add, edit, delete or view Users.                                                                                                                                                                                                |
-| Workflow      | Add, edit, delete or view Workflows.<br/>Note that Workflows are global; all users who can access workflows see the same set. Workflows have other permission implications — see [Workflow permissions](#workflow-permissions). |
+| Type             | Details                                                                                                                                                                                                                         |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AppConfig        | _Change_ or higher permissions grants access to the "Application Configuration" area.                                                                                                                                           |
+| Correspondent    | Add, edit, delete or view Correspondents.                                                                                                                                                                                       |
+| CustomField      | Add, edit, delete or view Custom Fields.                                                                                                                                                                                        |
+| Document         | Add, edit, delete or view Documents.                                                                                                                                                                                            |
+| DocumentType     | Add, edit, delete or view Document Types.                                                                                                                                                                                       |
+| Group            | Add, edit, delete or view Groups.                                                                                                                                                                                               |
+| GlobalStatistics | View aggregate object counts and statistics. This does not grant access to view individual documents.                                                                                                                           |
+| MailAccount      | Add, edit, delete or view Mail Accounts.                                                                                                                                                                                        |
+| MailRule         | Add, edit, delete or view Mail Rules.                                                                                                                                                                                           |
+| Note             | Add, edit, delete or view Notes.                                                                                                                                                                                                |
+| PaperlessTask    | View or dismiss (_Change_) File Tasks.                                                                                                                                                                                          |
+| SavedView        | Add, edit, delete or view Saved Views.                                                                                                                                                                                          |
+| ShareLink        | Add, delete or view Share Links.                                                                                                                                                                                                |
+| StoragePath      | Add, edit, delete or view Storage Paths.                                                                                                                                                                                        |
+| SystemMonitoring | View the system status dialog, tasks summary and their API endpoints. Admin users also retain system status access.                                                                                                             |
+| Tag              | Add, edit, delete or view Tags.                                                                                                                                                                                                 |
+| UISettings       | Add, edit, delete or view the UI settings that are used by the web app.<br/>:warning: **Users that will access the web UI must be granted at least _View_ permissions.**                                                        |
+| User             | Add, edit, delete or view other user accounts via Settings > Users & Groups and `/api/users/`. These permissions are not needed for users to edit their own profile via "My Profile" or `/api/profile/`.                        |
+| Workflow         | Add, edit, delete or view Workflows.<br/>Note that Workflows are global; all users who can access workflows see the same set. Workflows have other permission implications — see [Workflow permissions](#workflow-permissions). |
 
 #### Detailed Explanation of Object Permissions {#object-permissions}
 
@@ -426,11 +457,13 @@ still have "object-level" permissions.
 | View  | Confers the ability to view (not edit) a document, tag, etc.<br/>Users without 'view' (or higher) permissions will be shown _'Private'_ in place of the object name for example when viewing a document with a tag for which the user doesn't have permissions.                                                                          |
 | Edit  | Confers the ability to edit (and view) a document, tag, etc.                                                                                                                                                                                                                                                                             |
 
+For related metadata such as tags, correspondents, document types, and storage paths, object visibility and document assignment are intentionally distinct. A user may still retain or submit a known object ID when editing a document even if that related object is displayed as _Private_ or omitted from search and selection results. This allows documents to preserve existing assignments that the current user cannot necessarily inspect in detail.
+
 ### Password reset
 
 In order to enable the password reset feature you will need to setup an SMTP backend, see
-[`PAPERLESS_EMAIL_HOST`](configuration.md#PAPERLESS_EMAIL_HOST). If your installation does not have
-[`PAPERLESS_URL`](configuration.md#PAPERLESS_URL) set, the reset link included in emails will use the server host.
+[`PAPERLESS_EMAIL_HOST`](configuration.md#PAPERLESS_EMAIL_HOST). You should also set
+[`PAPERLESS_URL`](configuration.md#PAPERLESS_URL) and / or its corresponding configuration settings.
 
 ### Two-factor authentication
 
@@ -547,7 +580,9 @@ The following workflow action types are available:
 - Tags, correspondent, document type and storage path
 - Document owner
 - View and / or edit permissions to users or groups
-- Custom fields. Note that no value for the field will be set
+- Custom fields, optionally with a value. If no value is set, the field is only added to the
+  document and any value it may already have is left untouched. If a value is set, it will
+  overwrite an existing value of that field on the document.
 
 ##### Removal {#workflow-action-removal}
 
@@ -590,6 +625,34 @@ no other workflow will be executed on the document.
 
 If a "Move to Trash" action is executed in a consume pipeline, the consumption
 will be aborted and the file will be deleted.
+
+##### Password Removal {#workflow-action-password-removal}
+
+"Password Removal" actions attempt to remove password protection from encrypted PDF documents. You can specify:
+
+- One or more passwords to try, separated by commas or new lines
+- Each password is tried in order until one successfully unlocks the document
+
+Password removal never modifies a file in place. Instead, once a working password is found, the
+decrypted content is consumed as a new [document version](#document-file-versions), leaving the
+original (still encrypted) version in the document's version history.
+
+**Consumption Started**: because this trigger fires before the document exists yet, the password
+removal itself is deferred until after the initial consumption of the encrypted file has completed.
+OCR engines cannot process an encrypted PDF, so this first version is typically stored with no
+extracted text (unless the file already contained extractable text outside of OCR). Immediately
+afterwards, the password is removed and the decrypted file is automatically re-consumed as a second,
+new version of the same document, this time with normal OCR/text extraction applied. In other words,
+a password-protected file added with this trigger will briefly exist as an un-OCR'd version before
+the properly processed version is created.
+
+**Document Added**, **Document Updated**, **Scheduled**: these triggers run against a document that
+already exists, so password removal happens immediately: the decrypted content is queued for
+consumption as a new version right away. Note that if the document's initial consumption also
+happened while it was still encrypted, that original version will likewise be missing OCR text.
+
+**Current limitation**: Passwords are stored as a simple list without descriptions. To handle
+multiple PDF types with different passwords, create separate workflows for each use case.
 
 #### Workflow placeholders
 
@@ -804,13 +867,20 @@ contract you signed 8 years ago).
 
 When you search paperless for a document, it tries to match this query
 against your documents. Paperless will look for matching documents by
-inspecting their content, title, correspondent, type and tags. Paperless
+inspecting their content, title, correspondent, type, and tags. Paperless
 returns a scored list of results, so that documents matching your query
-better will appear further up in the search results.
+better will appear further up in the search results. Notes and custom field
+values can be searched using the advanced search syntax described below.
 
 By default, paperless returns only documents which contain all words
-typed in the search bar. However, paperless also offers advanced search
-syntax if you want to drill down the results further.
+typed in the search bar. A few things to know about how matching works:
+
+- **Word-order-independent**: "invoice unpaid" and "unpaid invoice" return the same results.
+- **Accent-insensitive**: searching `resume` also finds `résumé`, `cafe` finds `café`.
+- **Separator-agnostic**: punctuation and separators are stripped during indexing, so
+  searching a partial number like `1312` finds documents containing `A-1312/B`.
+
+Paperless also offers advanced search syntax if you want to drill down further.
 
 Matching documents with logical expressions:
 
@@ -839,18 +909,71 @@ Matching inexact words:
 produ*name
 ```
 
+Matching natural date keywords:
+
+```
+added:today
+modified:yesterday
+created:"previous week"
+added:"previous month"
+modified:"this year"
+```
+
+Supported date keywords: `today`, `yesterday`, `previous week`,
+`this month`, `previous month`, `this year`, `previous year`,
+`previous quarter`.
+
+#### Searching custom fields
+
+Custom field names and values are included in the full-text index, but they
+are not searched by a plain, unqualified query. Use the advanced search syntax
+to search by field name or value:
+
+```
+custom_fields.value:policy
+custom_fields.name:"Contract Number"
+custom_fields.name:Insurance custom_fields.value:policy
+```
+
+- `custom_fields.value` matches against the value of any custom field.
+- `custom_fields.name` matches the name of the field (use quotes for multi-word names).
+- Combine both to find documents where a specific named field contains a specific value.
+
+Because separators are stripped during indexing, individual parts of formatted
+codes are searchable on their own. A value stored as `A-1312/99.50` produces the
+tokens `a`, `1312`, `99`, `50` — each searchable independently:
+
+```
+custom_fields.value:1312
+custom_fields.name:"Contract Number" custom_fields.value:1312
+```
+
 !!! note
 
-    Inexact terms are hard for search indexes. These queries might take a
-    while to execute. That's why paperless offers auto complete and query
-    correction.
+    Custom date fields do not support relative date syntax (e.g. `[now to 2 weeks]`).
+    For date ranges on custom date fields, use the document list filters in the web UI.
+
+#### Searching notes
+
+Notes are included in the full-text index, but they are not searched by a
+plain, unqualified query. Use the advanced search syntax to search by note
+author or content:
+
+```
+notes.user:alice
+notes.note:reminder
+notes.user:alice notes.note:insurance
+```
 
 All of these constructs can be combined as you see fit. If you want to
-learn more about the query language used by paperless, paperless uses
-Whoosh's default query language. Head over to [Whoosh query
-language](https://whoosh.readthedocs.io/en/latest/querylang.html). For
-details on what date parsing utilities are available, see [Date
-parsing](https://whoosh.readthedocs.io/en/latest/dates.html#parsing-date-queries).
+learn more about the query language used by paperless, see the
+[Tantivy query language documentation](https://docs.rs/tantivy/latest/tantivy/query/struct.QueryParser.html).
+
+!!! note
+
+    Fuzzy (approximate) matching can be enabled by setting
+    [`PAPERLESS_ADVANCED_FUZZY_SEARCH_THRESHOLD`](configuration.md#PAPERLESS_ADVANCED_FUZZY_SEARCH_THRESHOLD).
+    When enabled, paperless will include near-miss results ranked below exact matches.
 
 ## Keyboard shortcuts / hotkeys
 
@@ -1028,7 +1151,7 @@ Paperless-ngx consists of the following components:
   errors (i.e., wrong email credentials, errors during consuming a
   specific file, etc).
 
-- A [redis](https://redis.io/) message broker: This is a really
+- A message broker (such as Valkey or Redis): This is a really
   lightweight service that is responsible for getting the tasks from
   the webserver and the consumer to the task scheduler. These run in a
   different process (maybe even on different machines!), and

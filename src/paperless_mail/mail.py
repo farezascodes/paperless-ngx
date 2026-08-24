@@ -4,6 +4,7 @@ import logging
 import ssl
 import tempfile
 import traceback
+import unicodedata
 from datetime import date
 from datetime import timedelta
 from fnmatch import fnmatch
@@ -17,6 +18,7 @@ from celery import shared_task
 from celery.canvas import Signature
 from django.conf import settings
 from django.db import DatabaseError
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.timezone import is_naive
 from django.utils.timezone import make_aware
@@ -37,8 +39,11 @@ from documents.data_models import DocumentMetadataOverrides
 from documents.data_models import DocumentSource
 from documents.loggers import LoggingMixin
 from documents.models import Correspondent
+from documents.models import PaperlessTask
 from documents.parsers import is_mime_type_supported
 from documents.tasks import consume_file
+from paperless.network import is_public_ip
+from paperless.network import resolve_hostname_ips
 from paperless_mail.models import MailAccount
 from paperless_mail.models import MailRule
 from paperless_mail.models import ProcessedMail
@@ -67,6 +72,14 @@ APPLE_MAIL_TAG_COLORS = {
     "violet": ["$MailFlagBit0", "$MailFlagBit2"],
     "grey": ["$MailFlagBit1", "$MailFlagBit2"],
 }
+
+MAIL_FETCH_BATCH_SIZE = 500
+
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER has been 32766 since 3.32.0
+# (2020), but older/custom builds and other backends may allow fewer, so
+# stay comfortably under that ceiling for `uid__in` queries against
+# ProcessedMail.
+PROCESSED_UID_QUERY_BATCH_SIZE = 10_000
 
 
 class MailError(Exception):
@@ -236,11 +249,12 @@ def mailbox_login(mailbox: MailBox, account: MailAccount) -> None:
 
 @shared_task
 def apply_mail_action(
-    result: list[str],
+    result: list,
     rule_id: int,
     message_uid: str,
     message_subject: str,
     message_date: datetime.datetime,
+    uid_validity: str | None = None,
 ) -> None:
     """
     This shared task applies the mail action of a particular mail rule to the
@@ -282,6 +296,7 @@ def apply_mail_action(
             rule=rule,
             folder=rule.folder,
             uid=message_uid,
+            uid_validity=uid_validity,
             subject=message_subject,
             received=message_date,
             status="SUCCESS",
@@ -293,6 +308,7 @@ def apply_mail_action(
             rule=rule,
             folder=rule.folder,
             uid=message_uid,
+            uid_validity=uid_validity,
             subject=message_subject,
             received=message_date,
             status="FAILED",
@@ -310,6 +326,7 @@ def error_callback(
     message_uid: str,
     message_subject: str,
     message_date: datetime.datetime,
+    uid_validity: str | None = None,
 ) -> None:
     """
     A shared task that is called whenever something goes wrong during
@@ -321,6 +338,7 @@ def error_callback(
         rule=rule,
         folder=rule.folder,
         uid=message_uid,
+        uid_validity=uid_validity,
         subject=message_subject,
         received=make_aware(message_date) if is_naive(message_date) else message_date,
         status="FAILED",
@@ -333,6 +351,7 @@ def queue_consumption_tasks(
     consume_tasks: list[Signature],
     rule: MailRule,
     message: MailMessage,
+    uid_validity: str | None,
 ) -> None:
     """
     Queue a list of consumption tasks (Signatures for the consume_file shared
@@ -344,6 +363,7 @@ def queue_consumption_tasks(
         message_uid=message.uid,
         message_subject=message.subject,
         message_date=message.date,
+        uid_validity=uid_validity,
     )
     chord(header=consume_tasks, body=mail_action_task).on_error(
         error_callback.s(
@@ -351,6 +371,7 @@ def queue_consumption_tasks(
             message_uid=message.uid,
             message_subject=message.subject,
             message_date=message.date,
+            uid_validity=uid_validity,
         ),
     ).delay()
 
@@ -412,6 +433,13 @@ def get_mailbox(server, port, security) -> MailBox:
     """
     Returns the correct MailBox instance for the given configuration.
     """
+    if not settings.EMAIL_ALLOW_INTERNAL_HOSTS:
+        for ip_str in resolve_hostname_ips(server):
+            if not is_public_ip(ip_str):
+                raise MailError(
+                    f"Connection blocked: {server} resolves to a non-public address",
+                )
+
     ssl_context = ssl.create_default_context()
     if settings.EMAIL_CERTIFICATE_FILE is not None:  # pragma: no cover
         ssl_context.load_verify_locations(cafile=settings.EMAIL_CERTIFICATE_FILE)
@@ -449,6 +477,7 @@ class MailAccountHandler(LoggingMixin):
         super().__init__()
         self.renew_logging_group()
         self._init_preprocessors()
+        self._current_uid_validity: str | None = None
 
     def _init_preprocessors(self) -> None:
         self._message_preprocessors: list[MailMessagePreprocessor] = []
@@ -472,6 +501,7 @@ class MailAccountHandler(LoggingMixin):
                 name=name,
                 defaults={
                     "match": name,
+                    "matching_algorithm": Correspondent.MATCH_LITERAL,
                 },
             )[0]
         except DatabaseError as e:
@@ -485,10 +515,10 @@ class MailAccountHandler(LoggingMixin):
         rule: MailRule,
     ) -> str | None:
         if rule.assign_title_from == MailRule.TitleSource.FROM_SUBJECT:
-            return message.subject
+            return unicodedata.normalize("NFC", message.subject)
 
         elif rule.assign_title_from == MailRule.TitleSource.FROM_FILENAME:
-            return Path(att.filename).stem
+            return unicodedata.normalize("NFC", Path(att.filename).stem)
 
         elif rule.assign_title_from == MailRule.TitleSource.NONE:
             return None
@@ -497,6 +527,21 @@ class MailAccountHandler(LoggingMixin):
             raise NotImplementedError(
                 "Unknown title selector.",
             )  # pragma: no cover
+
+    def _get_uid_validity(self, M: MailBox, folder: str) -> str | None:
+        try:
+            uid_validity = M.folder.status(folder, ["UIDVALIDITY"]).get("UIDVALIDITY")
+            if uid_validity is not None:
+                return str(uid_validity)
+        except errors.MailboxFolderStatusError as e:
+            self.log.warning(
+                f"Server does not support retrieving UIDVALIDITY for folder {folder}: {e}",
+            )
+        except Exception as e:
+            self.log.warning(
+                f"Unable to retrieve UIDVALIDITY for folder {folder}: {e}",
+            )
+        return None
 
     def _get_correspondent(
         self,
@@ -635,6 +680,8 @@ class MailAccountHandler(LoggingMixin):
                 f"does not exist in account {rule.account}",
             ) from err
 
+        self._current_uid_validity = self._get_uid_validity(M, rule.folder)
+
         criterias = make_criterias(rule, supports_gmail_labels=supports_gmail_labels)
 
         self.log.debug(
@@ -642,11 +689,44 @@ class MailAccountHandler(LoggingMixin):
         )
 
         try:
+            all_uids = set(
+                M.uids(criteria=criterias, charset=rule.account.character_set),
+            )
+        except Exception as err:
+            raise MailError(
+                f"Rule {rule}: Error while searching folder {rule.folder}",
+            ) from err
+
+        all_uids_list = list(all_uids)
+        processed_uids: set[str] = set()
+        for i in range(0, len(all_uids_list), PROCESSED_UID_QUERY_BATCH_SIZE):
+            uid_chunk = all_uids_list[i : i + PROCESSED_UID_QUERY_BATCH_SIZE]
+            processed_uids_qs = ProcessedMail.objects.filter(
+                rule=rule,
+                folder=rule.folder,
+                uid__in=uid_chunk,
+            )
+            if self._current_uid_validity is not None:
+                processed_uids_qs = processed_uids_qs.filter(
+                    Q(uid_validity=self._current_uid_validity)
+                    | Q(uid_validity__isnull=True),
+                )
+            processed_uids.update(processed_uids_qs.values_list("uid", flat=True))
+
+        new_uids = all_uids - processed_uids
+
+        if not new_uids:
+            self.log.debug(
+                f"Rule {rule}: No new mail matching criteria {criterias}",
+            )
+            return 0
+
+        sorted_new_uids = sorted(new_uids, key=int)
+        try:
             messages = M.fetch(
-                criteria=criterias,
+                uid_list=sorted_new_uids,
                 mark_seen=False,
-                charset=rule.account.character_set,
-                bulk=True,
+                bulk=MAIL_FETCH_BATCH_SIZE,
             )
         except Exception as err:
             raise MailError(
@@ -675,11 +755,17 @@ class MailAccountHandler(LoggingMixin):
                 )
                 continue
 
-            if ProcessedMail.objects.filter(
+            already_processed = ProcessedMail.objects.filter(
                 rule=rule,
                 uid=message.uid,
                 folder=rule.folder,
-            ).exists():
+            )
+            if self._current_uid_validity is not None:
+                already_processed = already_processed.filter(
+                    Q(uid_validity=self._current_uid_validity)
+                    | Q(uid_validity__isnull=True),
+                )
+            if already_processed.exists():
                 self.log.debug(
                     f"Skipping mail '{message.uid}' subject '{message.subject}' from '{message.from_}', already processed.",
                 )
@@ -712,6 +798,7 @@ class MailAccountHandler(LoggingMixin):
             not message.attachments
             and rule.consumption_scope == MailRule.ConsumptionScope.ATTACHMENTS_ONLY
         ):
+            self._record_processed_without_consumption(message, rule)
             return processed_elements
 
         self.log.debug(
@@ -746,6 +833,25 @@ class MailAccountHandler(LoggingMixin):
             )
 
         return processed_elements
+
+    def _record_processed_without_consumption(
+        self,
+        message: MailMessage,
+        rule: MailRule,
+    ) -> None:
+        ProcessedMail.objects.get_or_create(
+            rule=rule,
+            uid=message.uid,
+            folder=rule.folder,
+            uid_validity=self._current_uid_validity,
+            defaults={
+                "subject": message.subject,
+                "received": make_aware(message.date)
+                if is_naive(message.date)
+                else message.date,
+                "status": "PROCESSED_WO_CONSUMPTION",
+            },
+        )
 
     def filename_inclusion_matches(
         self,
@@ -855,7 +961,9 @@ class MailAccountHandler(LoggingMixin):
                     ),
                 )
 
-                attachment_name = pathvalidate.sanitize_filename(att.filename)
+                attachment_name = pathvalidate.sanitize_filename(
+                    unicodedata.normalize("NFC", att.filename),
+                )
                 if attachment_name:
                     temp_filename = temp_dir / attachment_name
                 else:  # pragma: no cover
@@ -871,7 +979,7 @@ class MailAccountHandler(LoggingMixin):
                 )
                 doc_overrides = DocumentMetadataOverrides(
                     title=title,
-                    filename=pathvalidate.sanitize_filename(att.filename),
+                    filename=attachment_name,
                     correspondent_id=correspondent.id if correspondent else None,
                     document_type_id=doc_type.id if doc_type else None,
                     tag_ids=tag_ids,
@@ -883,8 +991,12 @@ class MailAccountHandler(LoggingMixin):
                 )
 
                 consume_task = consume_file.s(
-                    input_doc,
-                    doc_overrides,
+                    input_doc=input_doc,
+                    overrides=doc_overrides,
+                ).set(
+                    headers={
+                        "trigger_source": PaperlessTask.TriggerSource.EMAIL_CONSUME,
+                    },
                 )
 
                 consume_tasks.append(consume_task)
@@ -903,24 +1015,11 @@ class MailAccountHandler(LoggingMixin):
                 consume_tasks=consume_tasks,
                 rule=rule,
                 message=message,
+                uid_validity=self._current_uid_validity,
             )
         else:
             # No files to consume, just mark as processed if it wasn't by .eml processing
-            if not ProcessedMail.objects.filter(
-                rule=rule,
-                uid=message.uid,
-                folder=rule.folder,
-            ).exists():
-                ProcessedMail.objects.create(
-                    rule=rule,
-                    folder=rule.folder,
-                    uid=message.uid,
-                    subject=message.subject,
-                    received=make_aware(message.date)
-                    if is_naive(message.date)
-                    else message.date,
-                    status="PROCESSED_WO_CONSUMPTION",
-                )
+            self._record_processed_without_consumption(message, rule)
 
         return processed_attachments
 
@@ -973,7 +1072,9 @@ class MailAccountHandler(LoggingMixin):
         )
         doc_overrides = DocumentMetadataOverrides(
             title=message.subject,
-            filename=pathvalidate.sanitize_filename(f"{message.subject}.eml"),
+            filename=pathvalidate.sanitize_filename(
+                unicodedata.normalize("NFC", f"{message.subject}.eml"),
+            ),
             correspondent_id=correspondent.id if correspondent else None,
             document_type_id=doc_type.id if doc_type else None,
             tag_ids=tag_ids,
@@ -981,14 +1082,15 @@ class MailAccountHandler(LoggingMixin):
         )
 
         consume_task = consume_file.s(
-            input_doc,
-            doc_overrides,
-        )
+            input_doc=input_doc,
+            overrides=doc_overrides,
+        ).set(headers={"trigger_source": PaperlessTask.TriggerSource.EMAIL_CONSUME})
 
         queue_consumption_tasks(
             consume_tasks=[consume_task],
             rule=rule,
             message=message,
+            uid_validity=self._current_uid_validity,
         )
 
         processed_elements = 1

@@ -27,6 +27,7 @@ from documents.views import EditPdfDocumentsView
 from documents.views import GlobalSearchView
 from documents.views import IndexView
 from documents.views import LogViewSet
+from documents.views import MergeDocumentsAsVersionsView
 from documents.views import MergeDocumentsView
 from documents.views import PostDocumentView
 from documents.views import RemoteVersionView
@@ -98,7 +99,21 @@ urlpatterns = [
                 re_path(
                     "^auth/",
                     include(
-                        ("rest_framework.urls", "rest_framework"),
+                        (
+                            [
+                                path(
+                                    "login/",
+                                    allauth_account_views.login,
+                                    name="login",
+                                ),
+                                path(
+                                    "logout/",
+                                    allauth_account_views.logout,
+                                    name="logout",
+                                ),
+                            ],
+                            "rest_framework",
+                        ),
                         namespace="rest_framework",
                     ),
                 ),
@@ -157,6 +172,11 @@ urlpatterns = [
                                 "^merge/",
                                 MergeDocumentsView.as_view(),
                                 name="merge_documents",
+                            ),
+                            re_path(
+                                "^merge_as_versions/",
+                                MergeDocumentsAsVersionsView.as_view(),
+                                name="merge_documents_as_versions",
                             ),
                             re_path(
                                 "^edit_pdf/",

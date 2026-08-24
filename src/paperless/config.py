@@ -4,6 +4,11 @@ import json
 from django.conf import settings
 
 from paperless.models import ApplicationConfiguration
+from paperless.models import ArchiveFileGenerationChoices
+from paperless.models import CleanChoices
+from paperless.models import ColorConvertChoices
+from paperless.models import ModeChoices
+from paperless.models import OutputTypeChoices
 
 
 @dataclasses.dataclass
@@ -28,12 +33,14 @@ class OutputTypeConfig(BaseConfig):
     Almost all parsers care about the chosen PDF output format
     """
 
-    output_type: str = dataclasses.field(init=False)
+    output_type: OutputTypeChoices = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
         app_config = self._get_config_instance()
 
-        self.output_type = app_config.output_type or settings.OCR_OUTPUT_TYPE
+        self.output_type = app_config.output_type or OutputTypeChoices(
+            settings.OCR_OUTPUT_TYPE,
+        )
 
 
 @dataclasses.dataclass
@@ -45,15 +52,17 @@ class OcrConfig(OutputTypeConfig):
 
     pages: int | None = dataclasses.field(init=False)
     language: str = dataclasses.field(init=False)
-    mode: str = dataclasses.field(init=False)
-    skip_archive_file: str = dataclasses.field(init=False)
+    mode: ModeChoices = dataclasses.field(init=False)
+    archive_file_generation: ArchiveFileGenerationChoices = dataclasses.field(
+        init=False,
+    )
     image_dpi: int | None = dataclasses.field(init=False)
-    clean: str = dataclasses.field(init=False)
+    clean: CleanChoices = dataclasses.field(init=False)
     deskew: bool = dataclasses.field(init=False)
     rotate: bool = dataclasses.field(init=False)
     rotate_threshold: float = dataclasses.field(init=False)
     max_image_pixel: float | None = dataclasses.field(init=False)
-    color_conversion_strategy: str = dataclasses.field(init=False)
+    color_conversion_strategy: ColorConvertChoices = dataclasses.field(init=False)
     user_args: dict[str, str] | None = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
@@ -63,12 +72,13 @@ class OcrConfig(OutputTypeConfig):
 
         self.pages = app_config.pages or settings.OCR_PAGES
         self.language = app_config.language or settings.OCR_LANGUAGE
-        self.mode = app_config.mode or settings.OCR_MODE
-        self.skip_archive_file = (
-            app_config.skip_archive_file or settings.OCR_SKIP_ARCHIVE_FILE
+        self.mode = app_config.mode or ModeChoices(settings.OCR_MODE)
+        self.archive_file_generation = (
+            app_config.archive_file_generation
+            or ArchiveFileGenerationChoices(settings.ARCHIVE_FILE_GENERATION)
         )
         self.image_dpi = app_config.image_dpi or settings.OCR_IMAGE_DPI
-        self.clean = app_config.unpaper_clean or settings.OCR_CLEAN
+        self.clean = app_config.unpaper_clean or CleanChoices(settings.OCR_CLEAN)
         self.deskew = (
             app_config.deskew if app_config.deskew is not None else settings.OCR_DESKEW
         )
@@ -85,7 +95,7 @@ class OcrConfig(OutputTypeConfig):
         )
         self.color_conversion_strategy = (
             app_config.color_conversion_strategy
-            or settings.OCR_COLOR_CONVERSION_STRATEGY
+            or ColorConvertChoices(settings.OCR_COLOR_CONVERSION_STRATEGY)
         )
 
         user_args = None
@@ -184,10 +194,15 @@ class AIConfig(BaseConfig):
     ai_enabled: bool = dataclasses.field(init=False)
     llm_embedding_backend: str = dataclasses.field(init=False)
     llm_embedding_model: str = dataclasses.field(init=False)
+    llm_embedding_endpoint: str = dataclasses.field(init=False)
+    llm_embedding_chunk_size: int = dataclasses.field(init=False)
+    llm_context_size: int = dataclasses.field(init=False)
+    llm_request_timeout: int = dataclasses.field(init=False)
     llm_backend: str = dataclasses.field(init=False)
     llm_model: str = dataclasses.field(init=False)
     llm_api_key: str = dataclasses.field(init=False)
     llm_endpoint: str = dataclasses.field(init=False)
+    llm_output_language: str = dataclasses.field(init=False)
     llm_allow_internal_endpoints: bool = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
@@ -200,10 +215,23 @@ class AIConfig(BaseConfig):
         self.llm_embedding_model = (
             app_config.llm_embedding_model or settings.LLM_EMBEDDING_MODEL
         )
+        self.llm_embedding_endpoint = (
+            app_config.llm_embedding_endpoint or settings.LLM_EMBEDDING_ENDPOINT
+        )
+        self.llm_embedding_chunk_size = (
+            app_config.llm_embedding_chunk_size or settings.LLM_EMBEDDING_CHUNK_SIZE
+        )
+        self.llm_context_size = app_config.llm_context_size or settings.LLM_CONTEXT_SIZE
+        self.llm_request_timeout = (
+            app_config.llm_request_timeout or settings.LLM_REQUEST_TIMEOUT
+        )
         self.llm_backend = app_config.llm_backend or settings.LLM_BACKEND
         self.llm_model = app_config.llm_model or settings.LLM_MODEL
         self.llm_api_key = app_config.llm_api_key or settings.LLM_API_KEY
         self.llm_endpoint = app_config.llm_endpoint or settings.LLM_ENDPOINT
+        self.llm_output_language = (
+            app_config.llm_output_language or settings.LLM_OUTPUT_LANGUAGE
+        )
         self.llm_allow_internal_endpoints = settings.LLM_ALLOW_INTERNAL_ENDPOINTS
 
     @property

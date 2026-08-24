@@ -5,12 +5,14 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Literal
+from typing import NamedTuple
 
 from celery import chord
 from celery import group
 from celery import shared_task
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Max
 from django.db.models import Q
 from django.utils import timezone
 
@@ -22,18 +24,25 @@ from documents.models import CustomField
 from documents.models import CustomFieldInstance
 from documents.models import Document
 from documents.models import DocumentType
+from documents.models import PaperlessTask
 from documents.models import StoragePath
 from documents.models import Tag
 from documents.permissions import set_permissions_for_object
 from documents.plugins.helpers import DocumentsStatusManager
 from documents.tasks import bulk_update_documents
 from documents.tasks import consume_file
+from documents.tasks import remove_document_from_index
 from documents.tasks import update_document_content_maybe_archive_file
 from documents.versioning import get_latest_version_for_root
 from documents.versioning import get_root_document
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from django.contrib.auth.models import User
+
+if settings.AUDIT_LOG_ENABLED:
+    from auditlog.models import LogEntry
 
 logger: logging.Logger = logging.getLogger("paperless.bulk_edit")
 
@@ -43,6 +52,11 @@ SourceMode = Literal["latest_version", "explicit_selection"]
 class SourceModeChoices:
     LATEST_VERSION: SourceMode = "latest_version"
     EXPLICIT_SELECTION: SourceMode = "explicit_selection"
+
+
+class ResolvedDocPair(NamedTuple):
+    root_doc: Document
+    source_doc: Document
 
 
 @shared_task(bind=True)
@@ -85,17 +99,20 @@ def _resolve_root_and_source_doc(
     doc: Document,
     *,
     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
-) -> tuple[Document, Document]:
+) -> ResolvedDocPair:
     root_doc = get_root_document(doc)
 
     if source_mode == SourceModeChoices.EXPLICIT_SELECTION:
-        return root_doc, doc
+        return ResolvedDocPair(root_doc=root_doc, source_doc=doc)
 
     # Version IDs are explicit by default, only a selected root resolves to latest
     if doc.root_document_id is not None:
-        return root_doc, doc
+        return ResolvedDocPair(root_doc=root_doc, source_doc=doc)
 
-    return root_doc, get_latest_version_for_root(root_doc)
+    return ResolvedDocPair(
+        root_doc=root_doc,
+        source_doc=get_latest_version_for_root(root_doc),
+    )
 
 
 def set_correspondent(
@@ -113,7 +130,10 @@ def set_correspondent(
     affected_docs = list(qs.values_list("pk", flat=True))
     qs.update(correspondent=correspondent)
 
-    bulk_update_documents.delay(document_ids=affected_docs)
+    bulk_update_documents.apply_async(
+        kwargs={"document_ids": affected_docs},
+        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+    )
 
     return "OK"
 
@@ -132,8 +152,9 @@ def set_storage_path(doc_ids: list[int], storage_path: StoragePath) -> Literal["
     affected_docs = list(qs.values_list("pk", flat=True))
     qs.update(storage_path=storage_path)
 
-    bulk_update_documents.delay(
-        document_ids=affected_docs,
+    bulk_update_documents.apply_async(
+        kwargs={"document_ids": affected_docs},
+        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
     )
 
     return "OK"
@@ -151,7 +172,10 @@ def set_document_type(doc_ids: list[int], document_type: DocumentType) -> Litera
     affected_docs = list(qs.values_list("pk", flat=True))
     qs.update(document_type=document_type)
 
-    bulk_update_documents.delay(document_ids=affected_docs)
+    bulk_update_documents.apply_async(
+        kwargs={"document_ids": affected_docs},
+        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+    )
 
     return "OK"
 
@@ -177,7 +201,10 @@ def add_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
         DocumentTagRelationship.objects.bulk_create(to_create)
 
     if affected_docs:
-        bulk_update_documents.delay(document_ids=list(affected_docs))
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": list(affected_docs)},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
     return "OK"
 
@@ -195,7 +222,10 @@ def remove_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
     qs.delete()
 
     if affected_docs:
-        bulk_update_documents.delay(document_ids=affected_docs)
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": affected_docs},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
     return "OK"
 
@@ -223,41 +253,40 @@ def modify_tags(
         expanded_remove_tags.add(int(t.id))
         expanded_remove_tags.update(int(pk) for pk in t.get_descendants_pks())
 
-    try:
-        with transaction.atomic():
-            if expanded_remove_tags:
+    with transaction.atomic():
+        if expanded_remove_tags:
+            DocumentTagRelationship.objects.filter(
+                document_id__in=affected_docs,
+                tag_id__in=expanded_remove_tags,
+            ).delete()
+
+        to_create = []
+        if expanded_add_tags:
+            existing_pairs = set(
                 DocumentTagRelationship.objects.filter(
                     document_id__in=affected_docs,
-                    tag_id__in=expanded_remove_tags,
-                ).delete()
+                    tag_id__in=expanded_add_tags,
+                ).values_list("document_id", "tag_id"),
+            )
 
-            to_create = []
-            if expanded_add_tags:
-                existing_pairs = set(
-                    DocumentTagRelationship.objects.filter(
-                        document_id__in=affected_docs,
-                        tag_id__in=expanded_add_tags,
-                    ).values_list("document_id", "tag_id"),
+            to_create = [
+                DocumentTagRelationship(document_id=doc, tag_id=tag)
+                for doc in affected_docs
+                for tag in expanded_add_tags
+                if (doc, tag) not in existing_pairs
+            ]
+
+            if to_create:
+                DocumentTagRelationship.objects.bulk_create(
+                    to_create,
+                    ignore_conflicts=True,
                 )
 
-                to_create = [
-                    DocumentTagRelationship(document_id=doc, tag_id=tag)
-                    for doc in affected_docs
-                    for tag in expanded_add_tags
-                    if (doc, tag) not in existing_pairs
-                ]
-
-                if to_create:
-                    DocumentTagRelationship.objects.bulk_create(
-                        to_create,
-                        ignore_conflicts=True,
-                    )
-
-            if affected_docs:
-                bulk_update_documents.delay(document_ids=affected_docs)
-    except Exception as e:
-        logger.error(f"Error modifying tags: {e}")
-        return "ERROR"
+    if affected_docs:
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": affected_docs},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
     return "OK"
 
@@ -326,7 +355,10 @@ def modify_custom_fields(
         field_id__in=remove_custom_fields,
     ).hard_delete()
 
-    bulk_update_documents.delay(document_ids=affected_docs)
+    bulk_update_documents.apply_async(
+        kwargs={"document_ids": affected_docs},
+        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+    )
 
     return "OK"
 
@@ -349,11 +381,11 @@ def delete(doc_ids: list[int]) -> Literal["OK"]:
 
         Document.objects.filter(id__in=delete_ids).delete()
 
-        from documents import index
+        from documents.search import get_backend
 
-        with index.open_index_writer() as writer:
+        with get_backend().batch_update() as batch:
             for id in delete_ids:
-                index.remove_document_by_id(writer, id)
+                batch.remove(id)
 
         status_mgr = DocumentsStatusManager()
         status_mgr.send_documents_deleted(delete_ids)
@@ -369,8 +401,9 @@ def delete(doc_ids: list[int]) -> Literal["OK"]:
 
 def reprocess(doc_ids: list[int]) -> Literal["OK"]:
     for document_id in doc_ids:
-        update_document_content_maybe_archive_file.delay(
-            document_id=document_id,
+        update_document_content_maybe_archive_file.apply_async(
+            kwargs={"document_id": document_id},
+            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
         )
 
     return "OK"
@@ -396,7 +429,10 @@ def set_permissions(
 
     affected_docs = list(qs.values_list("pk", flat=True))
 
-    bulk_update_documents.delay(document_ids=affected_docs)
+    bulk_update_documents.apply_async(
+        kwargs={"document_ids": affected_docs},
+        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+    )
 
     return "OK"
 
@@ -407,6 +443,7 @@ def rotate(
     *,
     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
     user: User | None = None,
+    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
 ) -> Literal["OK"]:
     logger.info(
         f"Attempting to rotate {len(doc_ids)} documents by {degrees} degrees.",
@@ -417,55 +454,55 @@ def rotate(
             id__in=doc_ids,
         )
     }
-    docs_by_root_id: dict[int, tuple[Document, Document]] = {}
+    docs_by_root_id: dict[int, ResolvedDocPair] = {}
     for doc_id in doc_ids:
         doc = docs_by_id.get(doc_id)
         if doc is None:
             continue
-        root_doc, source_doc = _resolve_root_and_source_doc(
-            doc,
-            source_mode=source_mode,
-        )
-        docs_by_root_id.setdefault(root_doc.id, (root_doc, source_doc))
+        pair = _resolve_root_and_source_doc(doc, source_mode=source_mode)
+        docs_by_root_id.setdefault(pair.root_doc.id, pair)
 
     import pikepdf
 
-    for root_doc, source_doc in docs_by_root_id.values():
-        if source_doc.mime_type != "application/pdf":
+    for pair in docs_by_root_id.values():
+        if pair.source_doc.mime_type != "application/pdf":
             logger.warning(
-                f"Document {root_doc.id} is not a PDF, skipping rotation.",
+                f"Document {pair.root_doc.id} is not a PDF, skipping rotation.",
             )
             continue
         try:
             # Write rotated output to a temp file and create a new version via consume pipeline
             filepath: Path = (
                 Path(tempfile.mkdtemp(dir=settings.SCRATCH_DIR))
-                / f"{root_doc.id}_rotated.pdf"
+                / f"{pair.root_doc.id}_rotated.pdf"
             )
-            with pikepdf.open(source_doc.source_path) as pdf:
+            with pikepdf.open(pair.source_doc.source_path) as pdf:
                 for page in pdf.pages:
                     page.rotate(degrees, relative=True)
                 pdf.remove_unreferenced_resources()
                 pdf.save(filepath)
 
             # Preserve metadata/permissions via overrides; mark as new version
-            overrides = DocumentMetadataOverrides().from_document(root_doc)
+            overrides = DocumentMetadataOverrides().from_document(pair.root_doc)
             if user is not None:
                 overrides.actor_id = user.id
 
-            consume_file.delay(
-                ConsumableDocument(
-                    source=DocumentSource.ConsumeFolder,
-                    original_file=filepath,
-                    root_document_id=root_doc.id,
-                ),
-                overrides,
+            consume_file.apply_async(
+                kwargs={
+                    "input_doc": ConsumableDocument(
+                        source=DocumentSource.ConsumeFolder,
+                        original_file=filepath,
+                        root_document_id=pair.root_doc.id,
+                    ),
+                    "overrides": overrides,
+                },
+                headers={"trigger_source": trigger_source},
             )
             logger.info(
-                f"Queued new rotated version for document {root_doc.id} by {degrees} degrees",
+                f"Queued new rotated version for document {pair.root_doc.id} by {degrees} degrees",
             )
         except Exception as e:
-            logger.exception(f"Error rotating document {root_doc.id}: {e}")
+            logger.exception(f"Error rotating document {pair.root_doc.id}: {e}")
 
     return "OK"
 
@@ -478,6 +515,7 @@ def merge(
     archive_fallback: bool = False,
     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
     user: User | None = None,
+    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
 ) -> Literal["OK"]:
     logger.info(
         f"Attempting to merge {len(doc_ids)} documents into a single document.",
@@ -495,17 +533,14 @@ def merge(
         doc = docs_by_id.get(doc_id)
         if doc is None:
             continue
-        _, source_doc = _resolve_root_and_source_doc(
-            doc,
-            source_mode=source_mode,
-        )
+        pair = _resolve_root_and_source_doc(doc, source_mode=source_mode)
         try:
             doc_path = (
-                source_doc.archive_path
+                pair.source_doc.archive_path
                 if archive_fallback
-                and source_doc.mime_type != "application/pdf"
-                and source_doc.has_archive_version
-                else source_doc.source_path
+                and pair.source_doc.mime_type != "application/pdf"
+                and pair.source_doc.has_archive_version
+                else pair.source_doc.source_path
             )
             with pikepdf.open(str(doc_path)) as pdf:
                 version = max(version, pdf.pdf_version)
@@ -556,12 +591,12 @@ def merge(
     logger.info("Adding merged document to the task queue.")
 
     consume_task = consume_file.s(
-        ConsumableDocument(
+        input_doc=ConsumableDocument(
             source=DocumentSource.ConsumeFolder,
             original_file=filepath,
         ),
-        overrides,
-    )
+        overrides=overrides,
+    ).set(headers={"trigger_source": trigger_source})
 
     if delete_originals:
         backup = release_archive_serial_numbers(affected_docs)
@@ -577,7 +612,116 @@ def merge(
             restore_archive_serial_numbers(backup)
             raise
     else:
-        consume_task.delay()
+        consume_task.apply_async()
+
+    return "OK"
+
+
+def merge_as_versions(
+    doc_ids: list[int],
+    *,
+    root_document_id: int,
+    version_label: str | None = None,
+    user: User | None = None,
+) -> Literal["OK"]:
+    with transaction.atomic():
+        documents = list(
+            # Ordered by pk so concurrent merges take the row locks in the same order
+            Document.objects.select_for_update()
+            .filter(id__in=doc_ids)
+            .order_by("id")
+            .defer("content"),
+        )
+        documents_by_id = {document.id: document for document in documents}
+
+        source_ids = [doc_id for doc_id in doc_ids if doc_id != root_document_id]
+        root_document = documents_by_id[root_document_id]
+        next_version_index = (
+            Document.global_objects.filter(
+                root_document_id=root_document_id,
+            ).aggregate(max_index=Max("version_index"))["max_index"]
+            or 0
+        )
+
+        # A version gives up its ASN
+        source_asns = [
+            documents_by_id[source_id].archive_serial_number
+            for source_id in source_ids
+            if documents_by_id[source_id].archive_serial_number is not None
+        ]
+
+        updated_fields = ["root_document", "version_index", "archive_serial_number"]
+        if version_label is not None:
+            updated_fields.append("version_label")
+
+        for source_id in source_ids:
+            next_version_index += 1
+            source_document = documents_by_id[source_id]
+            source_document.root_document_id = root_document.pk
+            source_document.version_index = next_version_index
+            source_document.archive_serial_number = None
+            if version_label is not None:
+                source_document.version_label = version_label
+
+        # bulk_update and not save() to avoid post_save now
+        Document.objects.bulk_update(
+            [documents_by_id[source_id] for source_id in source_ids],
+            updated_fields,
+        )
+
+        root_updates = {"modified": timezone.now()}
+        if source_asns and root_document.archive_serial_number is None:
+            # If a version had one, hand the ASN over, the same as merge() does
+            root_updates["archive_serial_number"] = source_asns.pop(0)
+            logger.info(
+                f"Document {root_document.id} took archive serial number "
+                f"{root_updates['archive_serial_number']} from a document merged into it",
+            )
+        if source_asns:
+            logger.warning(
+                f"Archive serial number(s) {source_asns} were removed by merging "
+                f"those documents as versions of document {root_document.id}",
+            )
+
+        Document.objects.filter(pk=root_document.pk).update(**root_updates)
+
+        if settings.AUDIT_LOG_ENABLED:
+            # update() doesn't fire auditlog signals, so manual
+            LogEntry.objects.log_create(
+                instance=root_document,
+                changes={"Merged As Versions": ["None", source_ids]},
+                action=LogEntry.Action.UPDATE,
+                actor=user,
+                additional_data={
+                    "reason": "Merged as versions",
+                    "version_ids": source_ids,
+                },
+            )
+
+    # One batch rather than a task each
+    from documents.search import SearchIndexLockError
+    from documents.search import get_backend
+
+    try:
+        with get_backend().batch_update() as batch:
+            for source_id in source_ids:
+                batch.remove(source_id)
+    except SearchIndexLockError:
+        logger.error(
+            f"Search index lock exhausted removing {source_ids}, "
+            f"scheduling deferred index removal",
+        )
+        for source_id in source_ids:
+            remove_document_from_index.apply_async(args=[source_id], countdown=60)
+
+    bulk_update_documents.apply_async(
+        kwargs={"document_ids": [root_document_id]},
+        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+    )
+
+    # And as far as the frontend is concerned, they're deleted
+    status_mgr = DocumentsStatusManager()
+    status_mgr.send_documents_deleted(source_ids)
 
     return "OK"
 
@@ -589,21 +733,19 @@ def split(
     delete_originals: bool = False,
     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
     user: User | None = None,
+    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
 ) -> Literal["OK"]:
     logger.info(
         f"Attempting to split document {doc_ids[0]} into {len(pages)} documents",
     )
     doc = Document.objects.select_related("root_document").get(id=doc_ids[0])
-    _, source_doc = _resolve_root_and_source_doc(
-        doc,
-        source_mode=source_mode,
-    )
+    pair = _resolve_root_and_source_doc(doc, source_mode=source_mode)
     import pikepdf
 
     consume_tasks = []
 
     try:
-        with pikepdf.open(source_doc.source_path) as pdf:
+        with pikepdf.open(pair.source_doc.source_path) as pdf:
             for idx, split_doc in enumerate(pages):
                 dst: pikepdf.Pdf = pikepdf.new()
                 for page in split_doc:
@@ -631,12 +773,12 @@ def split(
                 )
                 consume_tasks.append(
                     consume_file.s(
-                        ConsumableDocument(
+                        input_doc=ConsumableDocument(
                             source=DocumentSource.ConsumeFolder,
                             original_file=filepath,
                         ),
-                        overrides,
-                    ),
+                        overrides=overrides,
+                    ).set(headers={"trigger_source": trigger_source}),
                 )
 
             if delete_originals:
@@ -648,9 +790,9 @@ def split(
                     chord(
                         header=consume_tasks,
                         body=delete.si([doc.id]),
-                    ).apply_async(
-                        link_error=[restore_archive_serial_numbers_task.s(backup)],
-                    )
+                    ).on_error(
+                        restore_archive_serial_numbers_task.s(backup),
+                    ).apply_async()
                 except Exception:
                     restore_archive_serial_numbers(backup)
                     raise
@@ -669,15 +811,13 @@ def delete_pages(
     *,
     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
     user: User | None = None,
+    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
 ) -> Literal["OK"]:
     logger.info(
         f"Attempting to delete pages {pages} from {len(doc_ids)} documents",
     )
     doc = Document.objects.select_related("root_document").get(id=doc_ids[0])
-    root_doc, source_doc = _resolve_root_and_source_doc(
-        doc,
-        source_mode=source_mode,
-    )
+    pair = _resolve_root_and_source_doc(doc, source_mode=source_mode)
     pages = sorted(pages)  # sort pages to avoid index issues
     import pikepdf
 
@@ -685,9 +825,9 @@ def delete_pages(
         # Produce edited PDF to a temp file and create a new version
         filepath: Path = (
             Path(tempfile.mkdtemp(dir=settings.SCRATCH_DIR))
-            / f"{root_doc.id}_pages_deleted.pdf"
+            / f"{pair.root_doc.id}_pages_deleted.pdf"
         )
-        with pikepdf.open(source_doc.source_path) as pdf:
+        with pikepdf.open(pair.source_doc.source_path) as pdf:
             offset = 1  # pages are 1-indexed
             for page_num in pages:
                 pdf.pages.remove(pdf.pages[page_num - offset])
@@ -695,22 +835,25 @@ def delete_pages(
             pdf.remove_unreferenced_resources()
             pdf.save(filepath)
 
-        overrides = DocumentMetadataOverrides().from_document(root_doc)
+        overrides = DocumentMetadataOverrides().from_document(pair.root_doc)
         if user is not None:
             overrides.actor_id = user.id
-        consume_file.delay(
-            ConsumableDocument(
-                source=DocumentSource.ConsumeFolder,
-                original_file=filepath,
-                root_document_id=root_doc.id,
-            ),
-            overrides,
+        consume_file.apply_async(
+            kwargs={
+                "input_doc": ConsumableDocument(
+                    source=DocumentSource.ConsumeFolder,
+                    original_file=filepath,
+                    root_document_id=pair.root_doc.id,
+                ),
+                "overrides": overrides,
+            },
+            headers={"trigger_source": trigger_source},
         )
         logger.info(
-            f"Queued new version for document {root_doc.id} after deleting pages {pages}",
+            f"Queued new version for document {pair.root_doc.id} after deleting pages {pages}",
         )
     except Exception as e:
-        logger.exception(f"Error deleting pages from document {root_doc.id}: {e}")
+        logger.exception(f"Error deleting pages from document {pair.root_doc.id}: {e}")
 
     return "OK"
 
@@ -724,6 +867,7 @@ def edit_pdf(
     include_metadata: bool = True,
     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
     user: User | None = None,
+    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
 ) -> Literal["OK"]:
     """
     Operations is a list of dictionaries describing the final PDF pages.
@@ -737,16 +881,13 @@ def edit_pdf(
         f"Editing PDF of document {doc_ids[0]} with {len(operations)} operations",
     )
     doc = Document.objects.select_related("root_document").get(id=doc_ids[0])
-    root_doc, source_doc = _resolve_root_and_source_doc(
-        doc,
-        source_mode=source_mode,
-    )
+    pair = _resolve_root_and_source_doc(doc, source_mode=source_mode)
     import pikepdf
 
     pdf_docs: list[pikepdf.Pdf] = []
 
     try:
-        with pikepdf.open(source_doc.source_path) as src:
+        with pikepdf.open(pair.source_doc.source_path) as src:
             # prepare output documents
             max_idx = max(op.get("doc", 0) for op in operations)
             pdf_docs = [pikepdf.new() for _ in range(max_idx + 1)]
@@ -770,29 +911,32 @@ def edit_pdf(
             pdf.remove_unreferenced_resources()
             filepath: Path = (
                 Path(tempfile.mkdtemp(dir=settings.SCRATCH_DIR))
-                / f"{root_doc.id}_edited.pdf"
+                / f"{pair.root_doc.id}_edited.pdf"
             )
             pdf.save(filepath)
             overrides = (
-                DocumentMetadataOverrides().from_document(root_doc)
+                DocumentMetadataOverrides().from_document(pair.root_doc)
                 if include_metadata
                 else DocumentMetadataOverrides()
             )
             if user is not None:
                 overrides.owner_id = user.id
                 overrides.actor_id = user.id
-            consume_file.delay(
-                ConsumableDocument(
-                    source=DocumentSource.ConsumeFolder,
-                    original_file=filepath,
-                    root_document_id=root_doc.id,
-                ),
-                overrides,
+            consume_file.apply_async(
+                kwargs={
+                    "input_doc": ConsumableDocument(
+                        source=DocumentSource.ConsumeFolder,
+                        original_file=filepath,
+                        root_document_id=pair.root_doc.id,
+                    ),
+                    "overrides": overrides,
+                },
+                headers={"trigger_source": trigger_source},
             )
         else:
             consume_tasks = []
             overrides = (
-                DocumentMetadataOverrides().from_document(root_doc)
+                DocumentMetadataOverrides().from_document(pair.root_doc)
                 if include_metadata
                 else DocumentMetadataOverrides()
             )
@@ -802,22 +946,22 @@ def edit_pdf(
             if not delete_original:
                 overrides.skip_asn_if_exists = True
             if delete_original and len(pdf_docs) == 1:
-                overrides.asn = root_doc.archive_serial_number
+                overrides.asn = pair.root_doc.archive_serial_number
             for idx, pdf in enumerate(pdf_docs, start=1):
                 version_filepath: Path = (
                     Path(tempfile.mkdtemp(dir=settings.SCRATCH_DIR))
-                    / f"{root_doc.id}_edit_{idx}.pdf"
+                    / f"{pair.root_doc.id}_edit_{idx}.pdf"
                 )
                 pdf.remove_unreferenced_resources()
                 pdf.save(version_filepath)
                 consume_tasks.append(
                     consume_file.s(
-                        ConsumableDocument(
+                        input_doc=ConsumableDocument(
                             source=DocumentSource.ConsumeFolder,
                             original_file=version_filepath,
                         ),
-                        overrides,
-                    ),
+                        overrides=overrides,
+                    ).set(headers={"trigger_source": trigger_source}),
                 )
 
             if delete_original:
@@ -826,9 +970,9 @@ def edit_pdf(
                     chord(
                         header=consume_tasks,
                         body=delete.si([doc.id]),
-                    ).apply_async(
-                        link_error=[restore_archive_serial_numbers_task.s(backup)],
-                    )
+                    ).on_error(
+                        restore_archive_serial_numbers_task.s(backup),
+                    ).apply_async()
                 except Exception:
                     restore_archive_serial_numbers(backup)
                     raise
@@ -836,7 +980,7 @@ def edit_pdf(
                 group(consume_tasks).delay()
 
     except Exception as e:
-        logger.exception(f"Error editing document {root_doc.id}: {e}")
+        logger.exception(f"Error editing document {pair.root_doc.id}: {e}")
         raise ValueError(
             f"An error occurred while editing the document: {e}",
         ) from e
@@ -853,6 +997,8 @@ def remove_password(
     include_metadata: bool = True,
     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
     user: User | None = None,
+    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
+    source_paths_by_id: Mapping[int, Path] | None = None,
 ) -> Literal["OK"]:
     """
     Remove password protection from PDF documents.
@@ -861,18 +1007,34 @@ def remove_password(
 
     for doc_id in doc_ids:
         doc = Document.objects.select_related("root_document").get(id=doc_id)
-        root_doc, source_doc = _resolve_root_and_source_doc(
-            doc,
-            source_mode=source_mode,
-        )
+        pair = _resolve_root_and_source_doc(doc, source_mode=source_mode)
         try:
             logger.info(
-                f"Attempting password removal from document {doc_ids[0]}",
+                f"Attempting password removal from document {pair.root_doc.id}",
             )
-            with pikepdf.open(source_doc.source_path, password=password) as pdf:
+            # The caller may supply an explicit source path (e.g. the staged
+            # file during consumption, before source_path is populated).
+            source_path = (source_paths_by_id or {}).get(
+                doc.id,
+                pair.source_doc.source_path,
+            )
+            try:
+                with pikepdf.open(source_path) as pdf:
+                    if not pdf.is_encrypted:
+                        logger.info(
+                            "Skipping password removal for document %s because the "
+                            "source PDF is not encrypted",
+                            pair.root_doc.id,
+                        )
+                        continue
+            except pikepdf.PasswordError:
+                # Password-protected PDFs need the supplied password below.
+                pass
+
+            with pikepdf.open(source_path, password=password) as pdf:
                 filepath: Path = (
                     Path(tempfile.mkdtemp(dir=settings.SCRATCH_DIR))
-                    / f"{root_doc.id}_unprotected.pdf"
+                    / f"{pair.root_doc.id}_unprotected.pdf"
                 )
                 pdf.remove_unreferenced_resources()
                 pdf.save(filepath)
@@ -880,25 +1042,28 @@ def remove_password(
                 if update_document:
                     # Create a new version rather than modifying the root/original in place.
                     overrides = (
-                        DocumentMetadataOverrides().from_document(root_doc)
+                        DocumentMetadataOverrides().from_document(pair.root_doc)
                         if include_metadata
                         else DocumentMetadataOverrides()
                     )
                     if user is not None:
                         overrides.owner_id = user.id
                         overrides.actor_id = user.id
-                    consume_file.delay(
-                        ConsumableDocument(
-                            source=DocumentSource.ConsumeFolder,
-                            original_file=filepath,
-                            root_document_id=root_doc.id,
-                        ),
-                        overrides,
+                    consume_file.apply_async(
+                        kwargs={
+                            "input_doc": ConsumableDocument(
+                                source=DocumentSource.ConsumeFolder,
+                                original_file=filepath,
+                                root_document_id=pair.root_doc.id,
+                            ),
+                            "overrides": overrides,
+                        },
+                        headers={"trigger_source": trigger_source},
                     )
                 else:
                     consume_tasks = []
                     overrides = (
-                        DocumentMetadataOverrides().from_document(root_doc)
+                        DocumentMetadataOverrides().from_document(pair.root_doc)
                         if include_metadata
                         else DocumentMetadataOverrides()
                     )
@@ -908,12 +1073,12 @@ def remove_password(
 
                     consume_tasks.append(
                         consume_file.s(
-                            ConsumableDocument(
+                            input_doc=ConsumableDocument(
                                 source=DocumentSource.ConsumeFolder,
                                 original_file=filepath,
                             ),
-                            overrides,
-                        ),
+                            overrides=overrides,
+                        ).set(headers={"trigger_source": trigger_source}),
                     )
 
                     if delete_original:
@@ -926,7 +1091,7 @@ def remove_password(
 
         except Exception as e:
             logger.exception(
-                f"Error removing password from document {root_doc.id}: {e}",
+                f"Error removing password from document {pair.root_doc.id}: {e}",
             )
             raise ValueError(
                 f"An error occurred while removing the password: {e}",

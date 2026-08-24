@@ -30,7 +30,7 @@ RUN set -eux \
 # Purpose: Installs s6-overlay and rootfs
 # Comments:
 #  - Don't leave anything extra in here either
-FROM ghcr.io/astral-sh/uv:0.10.9-python3.12-trixie-slim AS s6-overlay-base
+FROM ghcr.io/astral-sh/uv:0.12.5-python3.14-trixie-slim AS s6-overlay-base
 
 WORKDIR /usr/src/s6
 
@@ -236,9 +236,15 @@ RUN set -eux \
     && mkdir -m700 --verbose /usr/src/paperless/.gnupg \
   && echo "Adjusting all permissions" \
     && chown --from root:root --changes --recursive paperless:paperless /usr/src/paperless \
+  && echo "Making fontconfig cache writable for arbitrary container UIDs" \
+    && chmod 1777 /var/cache/fontconfig \
+  && echo "Making /run world-writable for rootless operation" \
+    && chmod 1777 /run \
+  && echo "Removing setuid from s6-overlay-suexec for rootless compat" \
+    && chmod u-s /command/s6-overlay-suexec \
   && echo "Collecting static files" \
-    && s6-setuidgid paperless python3 manage.py collectstatic --clear --no-input --link \
-    && s6-setuidgid paperless python3 manage.py compilemessages \
+    && PAPERLESS_SECRET_KEY=build-time-dummy s6-setuidgid paperless python3 manage.py collectstatic --clear --no-input --link \
+    && PAPERLESS_SECRET_KEY=build-time-dummy s6-setuidgid paperless python3 manage.py compilemessages \
     && /usr/local/bin/deduplicate.py --verbose /usr/src/paperless/static/
 
 VOLUME ["/usr/src/paperless/data", \

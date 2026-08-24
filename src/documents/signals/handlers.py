@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import shutil
+import traceback as _tb
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 
 from celery import shared_task
-from celery import states
 from celery.signals import before_task_publish
 from celery.signals import task_failure
 from celery.signals import task_postrun
 from celery.signals import task_prerun
+from celery.signals import task_revoked
 from celery.signals import worker_process_init
+from celery.signals import worker_process_shutdown
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import User
@@ -51,6 +54,7 @@ from documents.models import WorkflowTrigger
 from documents.permissions import get_objects_for_user_owner_aware
 from documents.plugins.helpers import DocumentsStatusManager
 from documents.templating.utils import convert_format_str_to_template_format
+from documents.utils import compute_checksum
 from documents.workflows.actions import build_workflow_action_context
 from documents.workflows.actions import execute_email_action
 from documents.workflows.actions import execute_move_to_trash_action
@@ -403,6 +407,13 @@ class CannotMoveFilesException(Exception):
     pass
 
 
+def _path_matches_checksum(path: Path, checksum: str | None) -> bool:
+    if checksum is None or not path.is_file():
+        return False
+
+    return compute_checksum(path) == checksum
+
+
 def _filename_template_uses_custom_fields(doc: Document) -> bool:
     template = None
     if doc.storage_path is not None:
@@ -473,10 +484,12 @@ def update_filename_and_move_files(
             old_filename = instance.filename
             old_source_path = instance.source_path
             move_original = False
+            original_already_moved = False
 
             old_archive_filename = instance.archive_filename
             old_archive_path = instance.archive_path
             move_archive = False
+            archive_already_moved = False
 
             candidate_filename = generate_filename(instance)
             if len(str(candidate_filename)) > Document.MAX_STORED_FILENAME_LENGTH:
@@ -497,14 +510,23 @@ def update_filename_and_move_files(
                 candidate_source_path.exists()
                 and candidate_source_path != old_source_path
             ):
-                # Only fall back to unique search when there is an actual conflict
-                new_filename = generate_unique_filename(instance)
+                if not old_source_path.is_file() and _path_matches_checksum(
+                    candidate_source_path,
+                    instance.checksum,
+                ):
+                    new_filename = candidate_filename
+                    original_already_moved = True
+                else:
+                    # Only fall back to unique search when there is an actual conflict
+                    new_filename = generate_unique_filename(instance)
             else:
                 new_filename = candidate_filename
 
             # Need to convert to string to be able to save it to the db
             instance.filename = str(new_filename)
-            move_original = old_filename != instance.filename
+            move_original = (
+                old_filename != instance.filename and not original_already_moved
+            )
 
             if instance.has_archive_version:
                 archive_candidate = generate_filename(instance, archive_filename=True)
@@ -525,24 +547,38 @@ def update_filename_and_move_files(
                     archive_candidate_path.exists()
                     and archive_candidate_path != old_archive_path
                 ):
-                    new_archive_filename = generate_unique_filename(
-                        instance,
-                        archive_filename=True,
-                    )
+                    if not old_archive_path.is_file() and _path_matches_checksum(
+                        archive_candidate_path,
+                        instance.archive_checksum,
+                    ):
+                        new_archive_filename = archive_candidate
+                        archive_already_moved = True
+                    else:
+                        new_archive_filename = generate_unique_filename(
+                            instance,
+                            archive_filename=True,
+                        )
                 else:
                     new_archive_filename = archive_candidate
 
                 instance.archive_filename = str(new_archive_filename)
 
-                move_archive = old_archive_filename != instance.archive_filename
+                move_archive = (
+                    old_archive_filename != instance.archive_filename
+                    and not archive_already_moved
+                )
             else:
                 move_archive = False
 
             if not move_original and not move_archive:
-                # Just update modified. Also, don't save() here to prevent infinite recursion.
-                Document.objects.filter(pk=instance.pk).update(
-                    modified=timezone.now(),
-                )
+                updates = {"modified": timezone.now()}
+                if old_filename != instance.filename:
+                    updates["filename"] = instance.filename
+                if old_archive_filename != instance.archive_filename:
+                    updates["archive_filename"] = instance.archive_filename
+
+                # Don't save() here to prevent infinite recursion.
+                Document.objects.filter(pk=instance.pk).update(**updates)
                 return
 
             if move_original:
@@ -671,7 +707,7 @@ def check_paths_and_prune_custom_fields(
         and instance.fields.count() > 0
         and instance.extra_data
     ):  # Only select fields, for now
-        process_cf_select_update.delay(instance)
+        process_cf_select_update.apply_async(kwargs={"custom_field": instance})
 
 
 @receiver(models.signals.post_delete, sender=CustomField)
@@ -756,15 +792,14 @@ def cleanup_user_deletion(sender, instance: User | Group, **kwargs) -> None:
 
 
 def add_to_index(sender, document, **kwargs) -> None:
-    from documents import index
+    from documents.search import get_backend
 
-    index.add_or_update_document(document)
-    if document.root_document_id is not None and document.root_document is not None:
-        # keep in sync when a new version is consumed.
-        index.add_or_update_document(
-            document.root_document,
-            effective_content=document.content,
-        )
+    # A newly consumed version is not searchable on its own, its content
+    # becomes the effective_content of the root document
+    if document.root_document_id:
+        document = document.root_document
+
+    get_backend().add_or_update(document)
 
 
 def run_workflows_added(
@@ -846,6 +881,11 @@ def run_workflows(
         )
         return None
 
+    # Track whether the caller supplied original_file. When set explicitly (e.g. by
+    # run_workflows_added during consumption), it points at the staged file that has
+    # not yet been moved into its final storage location. This matters for password
+    # removal, which must read from the staged path rather than document.source_path.
+    caller_supplied_original_file = original_file is not None
     if original_file is None:
         original_file = (
             document.source_path if not use_overrides else document.original_file
@@ -863,7 +903,6 @@ def run_workflows(
                 # Refresh this so the matching data is fresh and instance fields are re-freshed
                 # Otherwise, this instance might be behind and overwrite the work another process did
                 document.refresh_from_db()
-                doc_tag_ids = list(document.tags.values_list("pk", flat=True))
             except Document.DoesNotExist:
                 # Document was hard deleted by a previous workflow or another process
                 logger.info(
@@ -897,14 +936,13 @@ def run_workflows(
                         apply_assignment_to_document(
                             action,
                             document,
-                            doc_tag_ids,
                             logging_group,
                         )
                 elif action.type == WorkflowAction.WorkflowActionType.REMOVAL:
                     if use_overrides and overrides:
                         apply_removal_to_overrides(action, overrides)
                     else:
-                        apply_removal_to_document(action, document, doc_tag_ids)
+                        apply_removal_to_document(action, document)
                 elif action.type == WorkflowAction.WorkflowActionType.EMAIL:
                     context = build_workflow_action_context(document, overrides)
                     execute_email_action(
@@ -925,18 +963,39 @@ def run_workflows(
                         original_file,
                     )
                 elif action.type == WorkflowAction.WorkflowActionType.PASSWORD_REMOVAL:
-                    execute_password_removal_action(action, document, logging_group)
+                    execute_password_removal_action(
+                        action,
+                        document,
+                        logging_group,
+                        source_file=(
+                            original_file if caller_supplied_original_file else None
+                        ),
+                    )
                 elif action.type == WorkflowAction.WorkflowActionType.MOVE_TO_TRASH:
                     has_move_to_trash_action = True
 
             if not use_overrides:
                 # limit title to 128 characters
                 document.title = document.title[:128]
-                # Make sure the filename and archive filename are accurate
-                document.refresh_from_db(fields=["filename", "archive_filename"])
-                # save first before setting tags
-                document.save()
-                document.tags.set(doc_tag_ids)
+                # Save only the fields that workflow actions can set directly.
+                # Deliberately excludes filename and archive_filename — those are
+                # managed exclusively by update_filename_and_move_files via the
+                # post_save signal. Writing stale in-memory values here would revert
+                # a concurrent update_filename_and_move_files DB write, leaving the
+                # DB pointing at the old path while the file is already at the new
+                # one (see: https://github.com/paperless-ngx/paperless-ngx/issues/12386).
+                # modified has auto_now=True but is not auto-added when update_fields
+                # is specified, so it must be listed explicitly.
+                document.save(
+                    update_fields=[
+                        "title",
+                        "correspondent",
+                        "document_type",
+                        "storage_path",
+                        "owner",
+                        "modified",
+                    ],
+                )
 
             WorkflowRun.objects.create(
                 workflow=workflow,
@@ -953,68 +1012,172 @@ def run_workflows(
         return overrides, "\n".join(messages)
 
 
-@before_task_publish.connect
-def before_task_publish_handler(sender=None, headers=None, body=None, **kwargs) -> None:
+# ---------------------------------------------------------------------------
+# Task tracking -- Celery signal handlers
+# ---------------------------------------------------------------------------
+
+TRACKED_TASKS: dict[str, PaperlessTask.TaskType] = {
+    "documents.tasks.consume_file": PaperlessTask.TaskType.CONSUME_FILE,
+    "documents.tasks.train_classifier": PaperlessTask.TaskType.TRAIN_CLASSIFIER,
+    "documents.tasks.sanity_check": PaperlessTask.TaskType.SANITY_CHECK,
+    "documents.tasks.llmindex_index": PaperlessTask.TaskType.LLM_INDEX,
+    "documents.tasks.empty_trash": PaperlessTask.TaskType.EMPTY_TRASH,
+    "documents.tasks.check_scheduled_workflows": PaperlessTask.TaskType.CHECK_WORKFLOWS,
+    "paperless_mail.tasks.process_mail_accounts": PaperlessTask.TaskType.MAIL_FETCH,
+    "documents.tasks.bulk_update_documents": PaperlessTask.TaskType.BULK_UPDATE,
+    "documents.tasks.update_document_content_maybe_archive_file": PaperlessTask.TaskType.REPROCESS_DOCUMENT,
+    "documents.tasks.build_share_link_bundle": PaperlessTask.TaskType.BUILD_SHARE_LINK,
+    "documents.bulk_edit.delete": PaperlessTask.TaskType.BULK_DELETE,
+}
+
+_CELERY_STATE_TO_STATUS: dict[str, PaperlessTask.Status] = {
+    "SUCCESS": PaperlessTask.Status.SUCCESS,
+    "FAILURE": PaperlessTask.Status.FAILURE,
+    "REVOKED": PaperlessTask.Status.REVOKED,
+}
+
+
+def _extract_input_data(
+    task_type: PaperlessTask.TaskType,
+    task_kwargs: dict,
+) -> dict:
+    """Build the input_data dict stored on the PaperlessTask record.
+
+    For consume_file tasks this includes the filename, MIME type, and any
+    non-null overrides from the DocumentMetadataOverrides object.  For
+    mail_fetch tasks it captures the account_ids list.  All other task
+    types store no input data and return {}.
     """
-    Creates the PaperlessTask object in a pending state.  This is sent before
-    the task reaches the broker, but before it begins executing on a worker.
+    if task_type == PaperlessTask.TaskType.CONSUME_FILE:
+        input_doc = task_kwargs.get("input_doc")
+        overrides = task_kwargs.get("overrides")
+        if input_doc is None:
+            return {}
+        data: dict = {
+            "filename": input_doc.original_file.name,
+            "mime_type": input_doc.mime_type,
+        }
+        if input_doc.original_path:  # pragma: no cover
+            data["source_path"] = str(input_doc.original_path)
+        if input_doc.mailrule_id:  # pragma: no cover
+            data["mailrule_id"] = input_doc.mailrule_id
+        if overrides:
+            override_dict = {}
+            for k, v in vars(overrides).items():
+                if v is None or k.startswith("_"):
+                    continue
+                if isinstance(v, datetime.date):
+                    v = v.isoformat()
+                elif isinstance(v, Path):
+                    v = str(v)
+                override_dict[k] = v
+            if override_dict:
+                data["overrides"] = override_dict
+        return data
+
+    if task_type == PaperlessTask.TaskType.MAIL_FETCH:
+        account_ids = task_kwargs.get("account_ids")
+        if account_ids is not None:
+            return {"account_ids": account_ids}
+        return {}
+
+    return {}
+
+
+def _determine_trigger_source(
+    headers: dict,
+) -> PaperlessTask.TriggerSource:
+    """Resolve the TriggerSource for a task being published to the broker.
+
+    Reads the trigger_source header set by the caller; falls back to MANUAL
+    when the header is absent or contains an unrecognised value.
+    """
+    header_source = headers.get("trigger_source")
+    if header_source is not None:
+        try:
+            return PaperlessTask.TriggerSource(header_source)
+        except ValueError:
+            pass
+    return PaperlessTask.TriggerSource.MANUAL
+
+
+def _extract_owner_id(
+    task_type: PaperlessTask.TaskType,
+    task_kwargs: dict,
+) -> int | None:
+    """Return the owner_id from consume_file overrides, or None for all other task types."""
+    if task_type != PaperlessTask.TaskType.CONSUME_FILE:
+        return None
+    overrides = task_kwargs.get("overrides")
+    if overrides and hasattr(overrides, "owner_id"):
+        return overrides.owner_id
+    return None  # pragma: no cover
+
+
+@before_task_publish.connect
+def before_task_publish_handler(
+    sender=None,
+    headers=None,
+    body=None,
+    **kwargs,
+) -> None:
+    """
+    Creates the PaperlessTask record when the task is published to broker.
 
     https://docs.celeryq.dev/en/stable/userguide/signals.html#before-task-publish
-
     https://docs.celeryq.dev/en/stable/internals/protocol.html#version-2
-
     """
-    if "task" not in headers or headers["task"] != "documents.tasks.consume_file":
-        # Assumption: this is only ever a v2 message
+    if headers is None or body is None:
+        return
+
+    task_name = headers.get("task", "")
+    task_type = TRACKED_TASKS.get(task_name)
+    if task_type is None:
         return
 
     try:
-        close_old_connections()
+        # Close stale connections without disrupting a transaction publishing a task
+        for connection in connections.all(initialized_only=True):
+            if not connection.in_atomic_block:
+                connection.close_if_unusable_or_obsolete()
 
-        task_args = body[0]
-        input_doc, overrides = task_args
+        _, task_kwargs, _ = body
+        task_id = headers["id"]
 
-        task_file_name = input_doc.original_file.name
-        user_id = overrides.owner_id if overrides else None
+        input_data = _extract_input_data(task_type, task_kwargs)
+        trigger_source = _determine_trigger_source(headers)
+        owner_id = _extract_owner_id(task_type, task_kwargs)
 
         PaperlessTask.objects.create(
-            type=PaperlessTask.TaskType.AUTO,
-            task_id=headers["id"],
-            status=states.PENDING,
-            task_file_name=task_file_name,
-            task_name=PaperlessTask.TaskName.CONSUME_FILE,
-            result=None,
-            date_created=timezone.now(),
-            date_started=None,
-            date_done=None,
-            owner_id=user_id,
+            task_id=task_id,
+            task_type=task_type,
+            trigger_source=trigger_source,
+            status=PaperlessTask.Status.PENDING,
+            input_data=input_data,
+            owner_id=owner_id,
         )
     except Exception:  # pragma: no cover
-        # Don't let an exception in the signal handlers prevent
-        # a document from being consumed.
         logger.exception("Creating PaperlessTask failed")
 
 
 @task_prerun.connect
 def task_prerun_handler(sender=None, task_id=None, task=None, **kwargs) -> None:
     """
-
-    Updates the PaperlessTask to be started.  Sent before the task begins execution
-    on a worker.
+    Marks the task STARTED when execution begins on a worker.
 
     https://docs.celeryq.dev/en/stable/userguide/signals.html#task-prerun
     """
+    if task_id is None:  # pragma: no cover
+        return
+    if task and task.name not in TRACKED_TASKS:
+        return
     try:
         close_old_connections()
-        task_instance = PaperlessTask.objects.filter(task_id=task_id).first()
-
-        if task_instance is not None:
-            task_instance.status = states.STARTED
-            task_instance.date_started = timezone.now()
-            task_instance.save()
+        PaperlessTask.objects.filter(task_id=task_id).update(
+            status=PaperlessTask.Status.STARTED,
+            date_started=timezone.now(),
+        )
     except Exception:  # pragma: no cover
-        # Don't let an exception in the signal handlers prevent
-        # a document from being consumed.
         logger.exception("Setting PaperlessTask started failed")
 
 
@@ -1028,22 +1191,54 @@ def task_postrun_handler(
     **kwargs,
 ) -> None:
     """
-    Updates the result of the PaperlessTask.
+    Records task completion and result data for non-failure outcomes.
+
+    Skips FAILURE states entirely, since task_failure_handler fires first
+    and fully owns the failure path (status, date_done, duration, result_data).
 
     https://docs.celeryq.dev/en/stable/userguide/signals.html#task-postrun
     """
+    if task_id is None:  # pragma: no cover
+        return
+    if task and task.name not in TRACKED_TASKS:
+        return
     try:
         close_old_connections()
-        task_instance = PaperlessTask.objects.filter(task_id=task_id).first()
 
-        if task_instance is not None:
-            task_instance.status = state or states.FAILURE
-            task_instance.result = retval
-            task_instance.date_done = timezone.now()
-            task_instance.save()
+        new_status = _CELERY_STATE_TO_STATUS.get(state, PaperlessTask.Status.FAILURE)
+        if new_status == PaperlessTask.Status.FAILURE:
+            return
+
+        now = timezone.now()
+        try:
+            task_instance = PaperlessTask.objects.get(task_id=task_id)
+        except PaperlessTask.DoesNotExist:
+            return
+
+        task_instance.status = new_status
+        task_instance.date_done = now
+        changed_fields = ["status", "date_done"]
+
+        if task_instance.date_started:
+            task_instance.duration_seconds = (
+                now - task_instance.date_started
+            ).total_seconds()
+            changed_fields.append("duration_seconds")
+        if task_instance.date_started and task_instance.date_created:
+            task_instance.wait_time_seconds = (
+                task_instance.date_started - task_instance.date_created
+            ).total_seconds()
+            changed_fields.append("wait_time_seconds")
+
+        if isinstance(retval, dict):
+            task_instance.result_data = retval
+            changed_fields.append("result_data")
+            if "duplicate_of" in retval:
+                task_instance.status = PaperlessTask.Status.FAILURE
+                changed_fields.append("status")
+
+        task_instance.save(update_fields=changed_fields)
     except Exception:  # pragma: no cover
-        # Don't let an exception in the signal handlers prevent
-        # a document from being consumed.
         logger.exception("Updating PaperlessTask failed")
 
 
@@ -1057,21 +1252,94 @@ def task_failure_handler(
     **kwargs,
 ) -> None:
     """
-    Updates the result of a failed PaperlessTask.
+    Records failure details when a task raises an exception.
+
+    Fully owns the FAILURE path. task_postrun_handler skips FAILURE
+    states so there is no overlap.
 
     https://docs.celeryq.dev/en/stable/userguide/signals.html#task-failure
     """
+    if task_id is None:  # pragma: no cover
+        return
+    if sender and sender.name not in TRACKED_TASKS:  # pragma: no cover
+        return
     try:
         close_old_connections()
-        task_instance = PaperlessTask.objects.filter(task_id=task_id).first()
 
-        if task_instance is not None and task_instance.result is None:
-            task_instance.status = states.FAILURE
-            task_instance.result = traceback
-            task_instance.date_done = timezone.now()
-            task_instance.save()
+        result_data: dict = {
+            "error_type": type(exception).__name__ if exception else "Unknown",
+            "error_message": str(exception) if exception else "Unknown error",
+        }
+        if traceback:
+            # billiard/celery pass a pre-formatted string instead of a real
+            # traceback object when the worker process itself died (e.g.
+            # WorkerLostError from a SIGILL) since there's no live traceback
+            # to walk in that case.
+            tb_str = (
+                traceback
+                if isinstance(traceback, str)
+                else "".join(
+                    _tb.format_tb(traceback),
+                )
+            )
+            result_data["traceback"] = tb_str[:5000]
+
+        now = timezone.now()
+        update_fields: dict = {
+            "status": PaperlessTask.Status.FAILURE,
+            "result_data": result_data,
+            "date_done": now,
+        }
+
+        task_qs = PaperlessTask.objects.filter(task_id=task_id)
+        task_instance = task_qs.values("date_started", "date_created").first()
+        if task_instance:
+            date_started = task_instance["date_started"]
+            if date_started:
+                update_fields["duration_seconds"] = (now - date_started).total_seconds()
+            date_created = task_instance["date_created"]
+            if date_started and date_created:
+                update_fields["wait_time_seconds"] = (
+                    date_started - date_created
+                ).total_seconds()
+            task_qs.update(**update_fields)
     except Exception:  # pragma: no cover
-        logger.exception("Updating PaperlessTask failed")
+        logger.exception("Updating PaperlessTask on failure failed")
+
+
+@task_revoked.connect
+def task_revoked_handler(
+    sender=None,
+    request=None,
+    *,
+    terminated: bool = False,
+    signum=None,
+    expired: bool = False,
+    **kwargs,
+) -> None:
+    """
+    Marks the task REVOKED when it is cancelled before or during execution.
+
+    This fires for tasks revoked while still queued (before task_prerun) as
+    well as for tasks terminated mid-run.  task_postrun does NOT fire for
+    pre-start revocations, so this handler is the only way to move those
+    records out of PENDING.
+
+    https://docs.celeryq.dev/en/stable/userguide/signals.html#task-revoked
+    """
+    task_id = request.id if request else None
+    if task_id is None:  # pragma: no cover
+        return
+    if sender and sender.name not in TRACKED_TASKS:  # pragma: no cover
+        return
+    try:
+        close_old_connections()
+        PaperlessTask.objects.filter(task_id=task_id).update(
+            status=PaperlessTask.Status.REVOKED,
+            date_done=timezone.now(),
+        )
+    except Exception:  # pragma: no cover
+        logger.exception("Updating PaperlessTask on revocation failed")
 
 
 @worker_process_init.connect
@@ -1089,15 +1357,31 @@ def close_connection_pool_on_worker_init(**kwargs) -> None:
             conn.close_pool()
 
 
+@worker_process_shutdown.connect
+def close_connection_pool_on_worker_shutdown(**kwargs) -> None:  # pragma: no cover
+    """
+    Close the DB connection pool when a Celery child process exits.
+
+    With CELERY_WORKER_MAX_TASKS_PER_CHILD=1 each child is replaced after a
+    single task. Without closing the pool on shutdown, its connections linger
+    on the server until TCP keepalive reaps them, accumulating over time.
+    """
+    for conn in connections.all(initialized_only=True):
+        if conn.alias == "default" and hasattr(conn, "pool") and conn.pool:
+            conn.close_pool()
+
+
 def add_or_update_document_in_llm_index(sender, document, **kwargs):
     """
     Add or update a document in the LLM index when it is created or updated.
     """
+    if kwargs.get("skip_ai_index"):
+        return
     ai_config = AIConfig()
     if ai_config.llm_index_enabled:
         from documents.tasks import update_document_in_llm_index
 
-        update_document_in_llm_index.delay(document)
+        update_document_in_llm_index.apply_async(kwargs={"document": document})
 
 
 @receiver(models.signals.post_delete, sender=Document)
@@ -1113,4 +1397,4 @@ def delete_document_from_llm_index(
     if ai_config.llm_index_enabled:
         from documents.tasks import remove_document_from_llm_index
 
-        remove_document_from_llm_index.delay(instance)
+        remove_document_from_llm_index.apply_async(kwargs={"document": instance})

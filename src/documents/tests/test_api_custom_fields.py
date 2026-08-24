@@ -6,6 +6,7 @@ from unittest.mock import ANY
 from django.contrib.auth.models import Permission
 from django.contrib.auth.models import User
 from django.test import override_settings
+from guardian.shortcuts import assign_perm
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -275,9 +276,11 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         )
 
         doc.refresh_from_db()
-        self.assertEqual(doc.custom_fields.first().value, None)
+        _cf_1 = doc.custom_fields.first()
+        assert _cf_1 is not None
+        self.assertEqual(_cf_1.value, None)
 
-    @mock.patch("documents.signals.handlers.process_cf_select_update.delay")
+    @mock.patch("documents.signals.handlers.process_cf_select_update.apply_async")
     def test_custom_field_update_offloaded_once(self, mock_delay) -> None:
         """
         GIVEN:
@@ -321,7 +324,7 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         }
         cf_select.save()
 
-        mock_delay.assert_called_once_with(cf_select)
+        mock_delay.assert_called_once_with(kwargs={"custom_field": cf_select})
 
     def test_create_custom_field_monetary_validation(self) -> None:
         """
@@ -566,7 +569,9 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(CustomFieldInstance.objects.count(), 1)
-        self.assertEqual(doc.custom_fields.first().value, "test value")
+        _cf_2 = doc.custom_fields.first()
+        assert _cf_2 is not None
+        self.assertEqual(_cf_2.value, "test value")
 
         # Update
         resp = self.client.patch(
@@ -583,7 +588,9 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(CustomFieldInstance.objects.count(), 1)
-        self.assertEqual(doc.custom_fields.first().value, "a new test value")
+        _cf_3 = doc.custom_fields.first()
+        assert _cf_3 is not None
+        self.assertEqual(_cf_3.value, "a new test value")
 
     def test_delete_custom_field_instance(self) -> None:
         """
@@ -649,7 +656,9 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(CustomFieldInstance.objects.count(), 1)
         self.assertEqual(Document.objects.count(), 1)
         self.assertEqual(len(doc.custom_fields.all()), 1)
-        self.assertEqual(doc.custom_fields.first().value, date_value)
+        _cf_4 = doc.custom_fields.first()
+        assert _cf_4 is not None
+        self.assertEqual(_cf_4.value, date_value)
 
     def test_custom_field_validation(self) -> None:
         """
@@ -1061,9 +1070,15 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(CustomFieldInstance.objects.count(), 4)
-        self.assertEqual(doc2.custom_fields.first().value, [1])
-        self.assertEqual(doc3.custom_fields.first().value, [1])
-        self.assertEqual(doc4.custom_fields.first().value, [1])
+        _cf_5 = doc2.custom_fields.first()
+        assert _cf_5 is not None
+        self.assertEqual(_cf_5.value, [1])
+        _cf_6 = doc3.custom_fields.first()
+        assert _cf_6 is not None
+        self.assertEqual(_cf_6.value, [1])
+        _cf_7 = doc4.custom_fields.first()
+        assert _cf_7 is not None
+        self.assertEqual(_cf_7.value, [1])
 
         # Add links appends if necessary
         resp = self.client.patch(
@@ -1080,7 +1095,9 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         )
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(doc4.custom_fields.first().value, [1, 3])
+        _cf_8 = doc4.custom_fields.first()
+        assert _cf_8 is not None
+        self.assertEqual(_cf_8.value, [1, 3])
 
         # Remove one of the links, removed on other doc
         resp = self.client.patch(
@@ -1097,9 +1114,15 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         )
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(doc2.custom_fields.first().value, [1])
-        self.assertEqual(doc3.custom_fields.first().value, [1, 4])
-        self.assertEqual(doc4.custom_fields.first().value, [3])
+        _cf_9 = doc2.custom_fields.first()
+        assert _cf_9 is not None
+        self.assertEqual(_cf_9.value, [1])
+        _cf_10 = doc3.custom_fields.first()
+        assert _cf_10 is not None
+        self.assertEqual(_cf_10.value, [1, 4])
+        _cf_11 = doc4.custom_fields.first()
+        assert _cf_11 is not None
+        self.assertEqual(_cf_11.value, [3])
 
         # Removes the field entirely
         resp = self.client.patch(
@@ -1111,9 +1134,15 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         )
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(doc2.custom_fields.first().value, [])
-        self.assertEqual(doc3.custom_fields.first().value, [4])
-        self.assertEqual(doc4.custom_fields.first().value, [3])
+        _cf_12 = doc2.custom_fields.first()
+        assert _cf_12 is not None
+        self.assertEqual(_cf_12.value, [])
+        _cf_13 = doc3.custom_fields.first()
+        assert _cf_13 is not None
+        self.assertEqual(_cf_13.value, [4])
+        _cf_14 = doc4.custom_fields.first()
+        assert _cf_14 is not None
+        self.assertEqual(_cf_14.value, [3])
 
         # If field exists on target doc but value is None
         doc5 = Document.objects.create(
@@ -1138,7 +1167,105 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         )
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(doc5.custom_fields.first().value, [1])
+        _cf_15 = doc5.custom_fields.first()
+        assert _cf_15 is not None
+        self.assertEqual(_cf_15.value, [1])
+
+    def test_documentlink_patch_requires_change_permission_on_target_documents(
+        self,
+    ) -> None:
+        source_owner = User.objects.create_user(username="source-owner")
+        source_owner.user_permissions.add(
+            Permission.objects.get(codename="change_document"),
+        )
+        other_user = User.objects.create_user(username="other-user")
+
+        source_doc = Document.objects.create(
+            title="Source",
+            checksum="source",
+            mime_type="application/pdf",
+            owner=source_owner,
+        )
+        target_doc = Document.objects.create(
+            title="Target",
+            checksum="target",
+            mime_type="application/pdf",
+            owner=other_user,
+        )
+        custom_field_doclink = CustomField.objects.create(
+            name="Test Custom Field Doc Link",
+            data_type=CustomField.FieldDataType.DOCUMENTLINK,
+        )
+
+        self.client.force_authenticate(user=source_owner)
+
+        resp = self.client.patch(
+            f"/api/documents/{source_doc.id}/",
+            data={
+                "custom_fields": [
+                    {
+                        "field": custom_field_doclink.id,
+                        "value": [target_doc.id],
+                    },
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            CustomFieldInstance.objects.filter(field=custom_field_doclink).count(),
+            0,
+        )
+
+    def test_documentlink_patch_allowed_with_change_permission_on_target_documents(
+        self,
+    ) -> None:
+        source_owner = User.objects.create_user(username="source-owner")
+        source_owner.user_permissions.add(
+            Permission.objects.get(codename="change_document"),
+        )
+        other_user = User.objects.create_user(username="other-user")
+
+        source_doc = Document.objects.create(
+            title="Source",
+            checksum="source",
+            mime_type="application/pdf",
+            owner=source_owner,
+        )
+        target_doc = Document.objects.create(
+            title="Target",
+            checksum="target",
+            mime_type="application/pdf",
+            owner=other_user,
+        )
+        custom_field_doclink = CustomField.objects.create(
+            name="Test Custom Field Doc Link",
+            data_type=CustomField.FieldDataType.DOCUMENTLINK,
+        )
+
+        assign_perm("change_document", source_owner, target_doc)
+        self.client.force_authenticate(user=source_owner)
+
+        resp = self.client.patch(
+            f"/api/documents/{source_doc.id}/",
+            data={
+                "custom_fields": [
+                    {
+                        "field": custom_field_doclink.id,
+                        "value": [target_doc.id],
+                    },
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        target_doc.refresh_from_db()
+        self.assertEqual(
+            target_doc.custom_fields.get(field=custom_field_doclink).value,
+            [source_doc.id],
+        )
 
     def test_custom_field_filters(self) -> None:
         custom_field_string = CustomField.objects.create(
@@ -1212,7 +1339,7 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         # Test as user without access to the document
         non_superuser = User.objects.create_user(username="non_superuser")
         non_superuser.user_permissions.add(
-            *Permission.objects.all(),
+            *Permission.objects.exclude(codename="view_global_statistics"),
         )
         non_superuser.save()
         self.client.force_authenticate(user=non_superuser)
@@ -1223,3 +1350,43 @@ class TestCustomFieldsAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         results = response.data["results"]
         self.assertEqual(results[0]["document_count"], 0)
+
+    def test_patch_document_invalid_date_custom_field_returns_validation_error(
+        self,
+    ) -> None:
+        """
+        GIVEN:
+            - A date custom field
+            - A document
+        WHEN:
+            - Patching the document with a date string in the wrong format
+        THEN:
+            - HTTP 400 is returned instead of an internal server error
+            - No custom field instance is created
+        """
+        cf_date = CustomField.objects.create(
+            name="datefield",
+            data_type=CustomField.FieldDataType.DATE,
+        )
+        doc = Document.objects.create(
+            title="Doc",
+            checksum="123",
+            mime_type="application/pdf",
+        )
+
+        response = self.client.patch(
+            f"/api/documents/{doc.pk}/",
+            {
+                "custom_fields": [
+                    {
+                        "field": cf_date.pk,
+                        "value": "10.03.2026",
+                    },
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("custom_fields", response.data)
+        self.assertEqual(CustomFieldInstance.objects.count(), 0)

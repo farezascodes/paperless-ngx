@@ -11,6 +11,7 @@ from typing import Final
 from urllib.parse import urlparse
 
 from compression_middleware.middleware import CompressionMiddleware
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.translation import gettext_lazy as _
 from dotenv import load_dotenv
 
@@ -21,6 +22,7 @@ from paperless.settings.custom import parse_hosting_settings
 from paperless.settings.custom import parse_ignore_dates
 from paperless.settings.custom import parse_redis_url
 from paperless.settings.parsers import get_bool_from_env
+from paperless.settings.parsers import get_choice_from_env
 from paperless.settings.parsers import get_float_from_env
 from paperless.settings.parsers import get_int_from_env
 from paperless.settings.parsers import get_list_from_env
@@ -85,11 +87,24 @@ EMPTY_TRASH_DIR = (
 # threads.
 MEDIA_LOCK = MEDIA_ROOT / "media.lock"
 INDEX_DIR = DATA_DIR / "index"
+
+ADVANCED_FUZZY_SEARCH_THRESHOLD: float | None = get_float_from_env(
+    "PAPERLESS_ADVANCED_FUZZY_SEARCH_THRESHOLD",
+)
+
 MODEL_FILE = get_path_from_env(
     "PAPERLESS_MODEL_FILE",
     DATA_DIR / "classification_model.pickle",
 )
 LLM_INDEX_DIR = DATA_DIR / "llm_index"
+LLM_INDEX_LOCK = LLM_INDEX_DIR / "index.lock"
+# Cross-process read/write lock guarding the LLM index compaction/migration
+# file swap. Readers hold it shared; the swap takes it exclusively so it never
+# runs while a reader connection is open. Must be a SQLite (.db) file.
+LLM_INDEX_RWLOCK = LLM_INDEX_DIR / "llmindex.rwlock.db"
+# Seconds the compaction swap waits for active readers to drain before skipping
+# this cycle (it is a maintenance operation; the next run retries).
+LLM_INDEX_COMPACTION_LOCK_TIMEOUT = 30
 
 LOGGING_DIR = get_path_from_env("PAPERLESS_LOGGING_DIR", DATA_DIR / "log")
 
@@ -121,15 +136,11 @@ INSTALLED_APPS = [
     "django_extensions",
     "paperless",
     "documents.apps.DocumentsConfig",
-    "paperless_tesseract.apps.PaperlessTesseractConfig",
-    "paperless_text.apps.PaperlessTextConfig",
     "paperless_mail.apps.PaperlessMailConfig",
-    "paperless_remote.apps.PaperlessRemoteParserConfig",
     "django.contrib.admin",
     "rest_framework",
     "rest_framework.authtoken",
     "django_filters",
-    "django_celery_results",
     "guardian",
     "allauth",
     "allauth.account",
@@ -158,6 +169,9 @@ REST_FRAMEWORK = {
     "ALLOWED_VERSIONS": ["9", "10"],
     # DRF Spectacular default schema
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "DEFAULT_THROTTLE_RATES": {
+        "login": os.getenv("PAPERLESS_TOKEN_THROTTLE_RATE", "5/min"),
+    },
 }
 
 if DEBUG:
@@ -330,6 +344,12 @@ SOCIAL_ACCOUNT_SYNC_GROUPS_CLAIM: Final[str] = os.getenv(
     "PAPERLESS_SOCIAL_ACCOUNT_SYNC_GROUPS_CLAIM",
     "groups",
 )
+SOCIAL_ACCOUNT_SYNC_SUPERUSER_GROUP: Final[str | None] = os.getenv(
+    "PAPERLESS_SOCIAL_ACCOUNT_SYNC_SUPERUSER_GROUP",
+)
+SOCIAL_ACCOUNT_SYNC_STAFF_GROUP: Final[str | None] = os.getenv(
+    "PAPERLESS_SOCIAL_ACCOUNT_SYNC_STAFF_GROUP",
+)
 
 HEADLESS_TOKEN_STRATEGY = "paperless.adapter.DrfTokenStrategy"
 
@@ -446,8 +466,25 @@ def _parse_paperless_url():
 
 PAPERLESS_URL = _parse_paperless_url()
 
+
+def _get_allauth_trusted_proxy_count(trusted_proxies: list[str]) -> int:
+    count = get_int_from_env(
+        "PAPERLESS_ALLAUTH_TRUSTED_PROXY_COUNT",
+        len(trusted_proxies),
+    )
+    if count < 0:
+        raise ImproperlyConfigured(
+            "PAPERLESS_ALLAUTH_TRUSTED_PROXY_COUNT must be zero or greater",
+        )
+    return count
+
+
 # For use with trusted proxies
 TRUSTED_PROXIES = get_list_from_env("PAPERLESS_TRUSTED_PROXIES")
+ALLAUTH_TRUSTED_PROXY_COUNT = _get_allauth_trusted_proxy_count(TRUSTED_PROXIES)
+ALLAUTH_TRUSTED_CLIENT_IP_HEADER = os.getenv(
+    "PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER",
+)
 
 USE_X_FORWARDED_HOST = get_bool_from_env("PAPERLESS_USE_X_FORWARD_HOST", "false")
 USE_X_FORWARDED_PORT = get_bool_from_env("PAPERLESS_USE_X_FORWARD_PORT", "false")
@@ -457,13 +494,13 @@ SECURE_PROXY_SSL_HEADER = (
     else None
 )
 
-# The secret key has a default that should be fine so long as you're hosting
-# Paperless on a closed network.  However, if you're putting this anywhere
-# public, you should change the key to something unique and verbose.
-SECRET_KEY = os.getenv(
-    "PAPERLESS_SECRET_KEY",
-    "e11fl1oa-*ytql8p)(06fbj4ukrlo+n7k&q5+$1md7i+mge=ee",
-)
+SECRET_KEY = os.getenv("PAPERLESS_SECRET_KEY")
+if not (SECRET_KEY or "").strip() or SECRET_KEY == "change-me":  # pragma: no cover
+    raise ImproperlyConfigured(
+        "PAPERLESS_SECRET_KEY is not set or is the default 'change-me' value. "
+        "A unique, secret key is required for secure operation. "
+        'Generate one with: python3 -c "import secrets; print(secrets.token_urlsafe(64))"',
+    )
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -494,6 +531,10 @@ SESSION_COOKIE_NAME = f"{COOKIE_PREFIX}sessionid"
 LANGUAGE_COOKIE_NAME = f"{COOKIE_PREFIX}django_language"
 
 EMAIL_CERTIFICATE_FILE = get_path_from_env("PAPERLESS_EMAIL_CERTIFICATE_LOCATION")
+EMAIL_ALLOW_INTERNAL_HOSTS = get_bool_from_env(
+    "PAPERLESS_EMAIL_ALLOW_INTERNAL_HOSTS",
+    "true",
+)
 
 
 ###############################################################################
@@ -581,8 +622,7 @@ LOGGING = {
     "disable_existing_loggers": False,
     "formatters": {
         "verbose": {
-            "format": "[{asctime}] [{levelname}] [{name}] {message}",
-            "style": "{",
+            "()": "paperless.logging.ConsumeTaskFormatter",
         },
         "simple": {
             "format": "{levelname} {message}",
@@ -627,6 +667,7 @@ LOGGING = {
         "kombu": {"handlers": ["file_celery"], "level": "DEBUG"},
         "_granian": {"handlers": ["file_paperless"], "level": "DEBUG"},
         "granian.access": {"handlers": ["file_paperless"], "level": "DEBUG"},
+        "httpx": {"level": "WARNING"},
     },
 }
 
@@ -641,6 +682,11 @@ logging.config.dictConfig(LOGGING)
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html
 
 CELERY_BROKER_URL = _CELERY_REDIS_URL
+CELERY_RESULT_BACKEND = _CELERY_REDIS_URL
+CELERY_RESULT_SERIALIZER = "signed-pickle"
+# Results are only needed for chord synchronization
+# a short TTL avoids Redis memory accumulation.
+CELERY_RESULT_EXPIRES = 3600
 CELERY_TIMEZONE = TIME_ZONE
 
 CELERY_WORKER_HIJACK_ROOT_LOGGER = False
@@ -659,14 +705,14 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT: Final[int] = get_int_from_env("PAPERLESS_WORKER_TIMEOUT", 1800)
 
-CELERY_RESULT_EXTENDED = True
-CELERY_RESULT_BACKEND = "django-db"
 CELERY_CACHE_BACKEND = "default"
 
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#task-serializer
-CELERY_TASK_SERIALIZER = "pickle"
+# Uses HMAC-signed pickle to prevent RCE via malicious messages on an exposed Redis broker.
+# The signed-pickle serializer is registered in paperless/celery.py.
+CELERY_TASK_SERIALIZER = "signed-pickle"
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#std-setting-accept_content
-CELERY_ACCEPT_CONTENT = ["application/json", "application/x-python-serialize"]
+CELERY_ACCEPT_CONTENT = ["application/json", "application/x-signed-pickle"]
 
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#beat-schedule
 CELERY_BEAT_SCHEDULE = parse_beat_schedule()
@@ -877,10 +923,23 @@ OCR_LANGUAGE = os.getenv("PAPERLESS_OCR_LANGUAGE", "eng")
 # OCRmyPDF --output-type options are available.
 OCR_OUTPUT_TYPE = os.getenv("PAPERLESS_OCR_OUTPUT_TYPE", "pdfa")
 
-# skip. redo, force
-OCR_MODE = os.getenv("PAPERLESS_OCR_MODE", "skip")
+if os.environ.get("PAPERLESS_OCR_MODE", "") in (
+    "skip",
+    "skip_noarchive",
+):  # pragma: no cover
+    OCR_MODE = "auto"
+else:
+    OCR_MODE = get_choice_from_env(
+        "PAPERLESS_OCR_MODE",
+        {"auto", "force", "redo", "off"},
+        default="auto",
+    )
 
-OCR_SKIP_ARCHIVE_FILE = os.getenv("PAPERLESS_OCR_SKIP_ARCHIVE_FILE", "never")
+ARCHIVE_FILE_GENERATION = get_choice_from_env(
+    "PAPERLESS_ARCHIVE_FILE_GENERATION",
+    {"auto", "always", "never"},
+    default="auto",
+)
 
 OCR_IMAGE_DPI = get_int_from_env("PAPERLESS_OCR_IMAGE_DPI")
 
@@ -974,8 +1033,8 @@ TIKA_GOTENBERG_ENDPOINT = os.getenv(
     "http://localhost:3000",
 )
 
-if TIKA_ENABLED:
-    INSTALLED_APPS.append("paperless_tika.apps.PaperlessTikaConfig")
+# Tika parser is now integrated into the main parser registry
+# No separate Django app needed
 
 AUDIT_LOG_ENABLED = get_bool_from_env("PAPERLESS_AUDIT_LOG_ENABLED", "true")
 if AUDIT_LOG_ENABLED:
@@ -1036,9 +1095,54 @@ def _get_nltk_language_setting(ocr_lang: str) -> str | None:
     return iso_code_to_nltk.get(ocr_lang)
 
 
+def _get_search_language_setting(ocr_lang: str) -> str | None:
+    """
+    Determine the Tantivy stemmer language.
+
+    If PAPERLESS_SEARCH_LANGUAGE is explicitly set, it is validated against
+    the languages supported by Tantivy's built-in stemmer and returned as-is.
+    Otherwise the primary Tesseract language code from PAPERLESS_OCR_LANGUAGE
+    is mapped to the corresponding ISO 639-1 code understood by Tantivy.
+    Returns None when unset and the OCR language has no Tantivy stemmer.
+    """
+    explicit = os.environ.get("PAPERLESS_SEARCH_LANGUAGE")
+    if explicit is not None:
+        # Lazy import avoids any app-loading order concerns; _tokenizer has no
+        # Django dependencies so this is safe.
+        from documents.search._tokenizer import SUPPORTED_LANGUAGES
+
+        return get_choice_from_env("PAPERLESS_SEARCH_LANGUAGE", SUPPORTED_LANGUAGES)
+
+    # Infer from the primary Tesseract language code (ISO 639-2/T → ISO 639-1)
+    primary = ocr_lang.split("+", maxsplit=1)[0].lower()
+    _ocr_to_search: dict[str, str] = {
+        "ara": "ar",
+        "dan": "da",
+        "nld": "nl",
+        "eng": "en",
+        "fin": "fi",
+        "fra": "fr",
+        "deu": "de",
+        "ell": "el",
+        "hun": "hu",
+        "ita": "it",
+        "nor": "no",
+        "por": "pt",
+        "ron": "ro",
+        "rus": "ru",
+        "spa": "es",
+        "swe": "sv",
+        "tam": "ta",
+        "tur": "tr",
+    }
+    return _ocr_to_search.get(primary)
+
+
 NLTK_ENABLED: Final[bool] = get_bool_from_env("PAPERLESS_ENABLE_NLTK", "yes")
 
 NLTK_LANGUAGE: str | None = _get_nltk_language_setting(OCR_LANGUAGE)
+
+SEARCH_LANGUAGE: str | None = _get_search_language_setting(OCR_LANGUAGE)
 
 ###############################################################################
 # Email Preprocessors                                                         #
@@ -1104,14 +1208,32 @@ REMOTE_OCR_ENDPOINT = os.getenv("PAPERLESS_REMOTE_OCR_ENDPOINT")
 # AI Settings                                                                  #
 ################################################################################
 AI_ENABLED = get_bool_from_env("PAPERLESS_AI_ENABLED", "NO")
-LLM_EMBEDDING_BACKEND = os.getenv(
+LLM_EMBEDDING_BACKEND = get_choice_from_env(
     "PAPERLESS_AI_LLM_EMBEDDING_BACKEND",
-)  # "huggingface" or "openai"
+    {"huggingface", "openai-like", "ollama"},
+)
 LLM_EMBEDDING_MODEL = os.getenv("PAPERLESS_AI_LLM_EMBEDDING_MODEL")
-LLM_BACKEND = os.getenv("PAPERLESS_AI_LLM_BACKEND")  # "ollama" or "openai"
+LLM_EMBEDDING_ENDPOINT = os.getenv("PAPERLESS_AI_LLM_EMBEDDING_ENDPOINT")
+LLM_EMBEDDING_CHUNK_SIZE = get_int_from_env(
+    "PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE",
+    1024,
+)
+if LLM_EMBEDDING_CHUNK_SIZE < 1:
+    raise ImproperlyConfigured("PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE must be >= 1")
+LLM_CONTEXT_SIZE = get_int_from_env("PAPERLESS_AI_LLM_CONTEXT_SIZE", 8192)
+if LLM_CONTEXT_SIZE < 1:
+    raise ImproperlyConfigured("PAPERLESS_AI_LLM_CONTEXT_SIZE must be >= 1")
+LLM_REQUEST_TIMEOUT = get_int_from_env("PAPERLESS_AI_LLM_REQUEST_TIMEOUT", 120)
+if LLM_REQUEST_TIMEOUT < 1:
+    raise ImproperlyConfigured("PAPERLESS_AI_LLM_REQUEST_TIMEOUT must be >= 1")
+LLM_BACKEND = get_choice_from_env(
+    "PAPERLESS_AI_LLM_BACKEND",
+    {"ollama", "openai-like"},
+)
 LLM_MODEL = os.getenv("PAPERLESS_AI_LLM_MODEL")
 LLM_API_KEY = os.getenv("PAPERLESS_AI_LLM_API_KEY")
 LLM_ENDPOINT = os.getenv("PAPERLESS_AI_LLM_ENDPOINT")
+LLM_OUTPUT_LANGUAGE = os.getenv("PAPERLESS_AI_LLM_OUTPUT_LANGUAGE")
 LLM_ALLOW_INTERNAL_ENDPOINTS = get_bool_from_env(
     "PAPERLESS_AI_LLM_ALLOW_INTERNAL_ENDPOINTS",
     "true",

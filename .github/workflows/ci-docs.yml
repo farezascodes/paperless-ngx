@@ -10,10 +10,8 @@ concurrency:
   cancel-in-progress: true
 permissions:
   contents: read
-  pages: write
-  id-token: write
 env:
-  DEFAULT_UV_VERSION: "0.10.x"
+  DEFAULT_UV_VERSION: "0.12.x"
   DEFAULT_PYTHON_VERSION: "3.12"
 jobs:
   changes:
@@ -23,9 +21,10 @@ jobs:
       docs_changed: ${{ steps.force.outputs.run_all == 'true' || steps.filter.outputs.docs == 'true' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Decide run mode
         id: force
         run: |
@@ -51,7 +50,7 @@ jobs:
       - name: Detect changes
         id: filter
         if: steps.force.outputs.run_all != 'true'
-        uses: dorny/paths-filter@v3.0.2
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           base: ${{ steps.range.outputs.base }}
           ref: ${{ steps.range.outputs.ref }}
@@ -68,16 +67,18 @@ jobs:
     name: Build Documentation
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/configure-pages@v5.0.0
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Set up Python
         id: setup-python
-        uses: actions/setup-python@v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.DEFAULT_PYTHON_VERSION }}
       - name: Install uv
-        uses: astral-sh/setup-uv@v7.3.1
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: ${{ env.DEFAULT_UV_VERSION }}
           enable-cache: true
@@ -93,7 +94,7 @@ jobs:
             --frozen \
             zensical build --clean
       - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v4.0.0
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site
           name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
@@ -102,12 +103,15 @@ jobs:
     needs: [changes, build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.docs_changed == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy GitHub Pages
-        uses: actions/deploy-pages@v4.0.5
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
         id: deployment
         with:
           artifact_name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}

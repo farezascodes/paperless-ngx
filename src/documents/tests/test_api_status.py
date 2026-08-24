@@ -1,16 +1,20 @@
 import os
 import shutil
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
-from celery import states
+from django.contrib.auth.models import Permission
 from django.contrib.auth.models import User
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from documents.models import PaperlessTask
+from documents.permissions import has_system_status_permission
+from documents.tests.factories import PaperlessTaskFactory
 from paperless import version
 
 
@@ -74,6 +78,11 @@ class TestSystemStatus(APITestCase):
         self.assertEqual(response.data["tasks"]["redis_url"], "redis://localhost:6379")
         self.assertEqual(response.data["tasks"]["redis_status"], "ERROR")
         self.assertIsNotNone(response.data["tasks"]["redis_error"])
+        self.assertEqual(response.data["tasks"]["summary"]["days"], 30)
+        self.assertEqual(response.data["tasks"]["summary"]["total_count"], 0)
+        self.assertEqual(response.data["tasks"]["summary"]["success_count"], 0)
+        self.assertEqual(response.data["tasks"]["summary"]["failure_count"], 0)
+        self.assertEqual(response.data["tasks"]["summary"]["pending_count"], 0)
 
     def test_system_status_insufficient_permissions(self) -> None:
         """
@@ -86,10 +95,33 @@ class TestSystemStatus(APITestCase):
         """
         response = self.client.get(self.ENDPOINT)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response["WWW-Authenticate"], "Token")
         normal_user = User.objects.create_user(username="normal_user")
         self.client.force_login(normal_user)
         response = self.client.get(self.ENDPOINT)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        # test the permission helper function directly for good measure
+        self.assertFalse(has_system_status_permission(None))
+
+    def test_system_status_with_system_status_permission(self) -> None:
+        response = self.client.get(self.ENDPOINT)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        user = User.objects.create_user(username="status_user")
+        user.user_permissions.add(
+            Permission.objects.get(codename="view_system_monitoring"),
+        )
+
+        self.client.force_login(user)
+        response = self.client.get(self.ENDPOINT)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_system_status_with_bad_basic_auth_challenges(self) -> None:
+        self.client.credentials(HTTP_AUTHORIZATION="Basic invalid")
+        response = self.client.get(self.ENDPOINT)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response["WWW-Authenticate"], 'Basic realm="api"')
 
     def test_system_status_container_detection(self) -> None:
         """
@@ -184,40 +216,113 @@ class TestSystemStatus(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["tasks"]["celery_status"], "OK")
 
-    @override_settings(INDEX_DIR=Path("/tmp/index"))
-    @mock.patch("whoosh.index.FileIndex.last_modified")
-    def test_system_status_index_ok(self, mock_last_modified) -> None:
+    @mock.patch("celery.app.control.Inspect.ping")
+    def test_system_status_celery_ping_none(self, mock_ping) -> None:
         """
         GIVEN:
-            - The index last modified time is set
+            - Celery ping returns no worker responses
+        WHEN:
+            - The user requests the system status
+        THEN:
+            - The response contains a warning celery status
+        """
+        mock_ping.return_value = None
+        self.client.force_login(self.user)
+        response = self.client.get(self.ENDPOINT)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["tasks"]["celery_status"], "WARNING")
+        self.assertEqual(
+            response.data["tasks"]["celery_error"],
+            "No celery workers responded to ping. This may be temporary.",
+        )
+
+    @mock.patch("celery.app.control.Inspect.ping")
+    def test_system_status_celery_ping_unexpected_responses(self, mock_ping) -> None:
+        """
+        GIVEN:
+            - Celery ping returns an unexpected worker response
+        WHEN:
+            - The user requests the system status
+        THEN:
+            - The response contains a warning celery status
+        """
+        self.client.force_login(self.user)
+        for ping_response in (
+            {"hostname": {"ok": "not-pong"}},
+            {"hostname": {}},
+            {"hostname": "pong"},
+        ):
+            with self.subTest(ping_response=ping_response):
+                mock_ping.return_value = ping_response
+                response = self.client.get(self.ENDPOINT)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response.data["tasks"]["celery_status"], "WARNING")
+                self.assertEqual(response.data["tasks"]["celery_url"], "hostname")
+                self.assertEqual(
+                    response.data["tasks"]["celery_error"],
+                    "Celery worker responded unexpectedly.",
+                )
+
+    @mock.patch("documents.views.sleep")
+    @mock.patch("celery.app.control.Inspect.ping")
+    def test_system_status_celery_ping_retry_success(
+        self,
+        mock_ping,
+        mock_sleep,
+    ) -> None:
+        """
+        GIVEN:
+            - Celery ping fails once but succeeds on retry
+        WHEN:
+            - The user requests the system status
+        THEN:
+            - The response contains an OK celery status
+        """
+        mock_ping.side_effect = [None, {"hostname": {"ok": "pong"}}]
+        self.client.force_login(self.user)
+        response = self.client.get(self.ENDPOINT)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["tasks"]["celery_status"], "OK")
+        self.assertIsNone(response.data["tasks"]["celery_error"])
+        self.assertEqual(mock_ping.call_count, 2)
+        mock_sleep.assert_called_once_with(0.25)
+
+    @mock.patch("documents.search.get_backend")
+    def test_system_status_index_ok(self, mock_get_backend) -> None:
+        """
+        GIVEN:
+            - The index is accessible
         WHEN:
             - The user requests the system status
         THEN:
             - The response contains the correct index status
         """
-        mock_last_modified.return_value = 1707839087
-        self.client.force_login(self.user)
-        response = self.client.get(self.ENDPOINT)
+        mock_get_backend.return_value = mock.MagicMock()
+        # Use the temp dir created in setUp (self.tmp_dir) as a real INDEX_DIR
+        # with a real file so the mtime lookup works
+        sentinel = self.tmp_dir / "sentinel.txt"
+        sentinel.write_text("ok")
+        with self.settings(INDEX_DIR=self.tmp_dir):
+            self.client.force_login(self.user)
+            response = self.client.get(self.ENDPOINT)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["tasks"]["index_status"], "OK")
         self.assertIsNotNone(response.data["tasks"]["index_last_modified"])
 
-    @override_settings(INDEX_DIR=Path("/tmp/index/"))
-    @mock.patch("documents.index.open_index", autospec=True)
-    def test_system_status_index_error(self, mock_open_index) -> None:
+    @mock.patch("documents.search.get_backend")
+    def test_system_status_index_error(self, mock_get_backend) -> None:
         """
         GIVEN:
-            - The index is not found
+            - The index cannot be opened
         WHEN:
             - The user requests the system status
         THEN:
             - The response contains the correct index status
         """
-        mock_open_index.return_value = None
-        mock_open_index.side_effect = Exception("Index error")
+        mock_get_backend.side_effect = Exception("Index error")
         self.client.force_login(self.user)
         response = self.client.get(self.ENDPOINT)
-        mock_open_index.assert_called_once()
+        mock_get_backend.assert_called_once()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["tasks"]["index_status"], "ERROR")
         self.assertIsNotNone(response.data["tasks"]["index_error"])
@@ -231,10 +336,10 @@ class TestSystemStatus(APITestCase):
         THEN:
             - The response contains an OK classifier status
         """
-        PaperlessTask.objects.create(
-            type=PaperlessTask.TaskType.SCHEDULED_TASK,
-            status=states.SUCCESS,
-            task_name=PaperlessTask.TaskName.TRAIN_CLASSIFIER,
+        PaperlessTaskFactory(
+            task_type=PaperlessTask.TaskType.TRAIN_CLASSIFIER,
+            trigger_source=PaperlessTask.TriggerSource.SCHEDULED,
+            status=PaperlessTask.Status.SUCCESS,
         )
         self.client.force_login(self.user)
         response = self.client.get(self.ENDPOINT)
@@ -268,11 +373,11 @@ class TestSystemStatus(APITestCase):
         THEN:
             - The response contains an ERROR classifier status
         """
-        PaperlessTask.objects.create(
-            type=PaperlessTask.TaskType.SCHEDULED_TASK,
-            status=states.FAILURE,
-            task_name=PaperlessTask.TaskName.TRAIN_CLASSIFIER,
-            result="Classifier training failed",
+        PaperlessTaskFactory(
+            task_type=PaperlessTask.TaskType.TRAIN_CLASSIFIER,
+            trigger_source=PaperlessTask.TriggerSource.SCHEDULED,
+            status=PaperlessTask.Status.FAILURE,
+            result_data={"error_message": "Classifier training failed"},
         )
         self.client.force_login(self.user)
         response = self.client.get(self.ENDPOINT)
@@ -292,10 +397,10 @@ class TestSystemStatus(APITestCase):
         THEN:
             - The response contains an OK sanity check status
         """
-        PaperlessTask.objects.create(
-            type=PaperlessTask.TaskType.SCHEDULED_TASK,
-            status=states.SUCCESS,
-            task_name=PaperlessTask.TaskName.CHECK_SANITY,
+        PaperlessTaskFactory(
+            task_type=PaperlessTask.TaskType.SANITY_CHECK,
+            trigger_source=PaperlessTask.TriggerSource.SCHEDULED,
+            status=PaperlessTask.Status.SUCCESS,
         )
         self.client.force_login(self.user)
         response = self.client.get(self.ENDPOINT)
@@ -329,11 +434,11 @@ class TestSystemStatus(APITestCase):
         THEN:
             - The response contains an ERROR sanity check status
         """
-        PaperlessTask.objects.create(
-            type=PaperlessTask.TaskType.SCHEDULED_TASK,
-            status=states.FAILURE,
-            task_name=PaperlessTask.TaskName.CHECK_SANITY,
-            result="5 issues found.",
+        PaperlessTaskFactory(
+            task_type=PaperlessTask.TaskType.SANITY_CHECK,
+            trigger_source=PaperlessTask.TriggerSource.SCHEDULED,
+            status=PaperlessTask.Status.FAILURE,
+            result_data={"error_message": "5 issues found."},
         )
         self.client.force_login(self.user)
         response = self.client.get(self.ENDPOINT)
@@ -370,7 +475,7 @@ class TestSystemStatus(APITestCase):
         THEN:
             - The response contains the correct AI status
         """
-        with override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="openai"):
+        with override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="openai-like"):
             self.client.force_login(self.user)
 
             # No tasks found
@@ -378,10 +483,10 @@ class TestSystemStatus(APITestCase):
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             self.assertEqual(response.data["tasks"]["llmindex_status"], "WARNING")
 
-            PaperlessTask.objects.create(
-                type=PaperlessTask.TaskType.SCHEDULED_TASK,
-                status=states.SUCCESS,
-                task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
+            PaperlessTaskFactory(
+                task_type=PaperlessTask.TaskType.LLM_INDEX,
+                trigger_source=PaperlessTask.TriggerSource.SCHEDULED,
+                status=PaperlessTask.Status.SUCCESS,
             )
             response = self.client.get(self.ENDPOINT)
             self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -397,15 +502,44 @@ class TestSystemStatus(APITestCase):
         THEN:
             - The response contains the correct AI status
         """
-        with override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="openai"):
-            PaperlessTask.objects.create(
-                type=PaperlessTask.TaskType.SCHEDULED_TASK,
-                status=states.FAILURE,
-                task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
-                result="AI index update failed",
+        with override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="openai-like"):
+            PaperlessTaskFactory(
+                task_type=PaperlessTask.TaskType.LLM_INDEX,
+                trigger_source=PaperlessTask.TriggerSource.SCHEDULED,
+                status=PaperlessTask.Status.FAILURE,
+                result_data={"error_message": "AI index update failed"},
             )
             self.client.force_login(self.user)
             response = self.client.get(self.ENDPOINT)
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             self.assertEqual(response.data["tasks"]["llmindex_status"], "ERROR")
             self.assertIsNotNone(response.data["tasks"]["llmindex_error"])
+
+    def test_system_status_includes_recent_task_summary(self) -> None:
+        PaperlessTaskFactory(
+            task_type=PaperlessTask.TaskType.CONSUME_FILE,
+            status=PaperlessTask.Status.SUCCESS,
+        )
+        PaperlessTaskFactory(
+            task_type=PaperlessTask.TaskType.CONSUME_FILE,
+            status=PaperlessTask.Status.FAILURE,
+        )
+        PaperlessTaskFactory(
+            task_type=PaperlessTask.TaskType.SANITY_CHECK,
+            status=PaperlessTask.Status.PENDING,
+        )
+        PaperlessTaskFactory(
+            task_type=PaperlessTask.TaskType.MAIL_FETCH,
+            status=PaperlessTask.Status.SUCCESS,
+            date_created=timezone.now() - timedelta(days=45),
+        )
+
+        self.client.force_login(self.user)
+        response = self.client.get(self.ENDPOINT)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["tasks"]["summary"]["days"], 30)
+        self.assertEqual(response.data["tasks"]["summary"]["total_count"], 3)
+        self.assertEqual(response.data["tasks"]["summary"]["success_count"], 1)
+        self.assertEqual(response.data["tasks"]["summary"]["failure_count"], 1)
+        self.assertEqual(response.data["tasks"]["summary"]["pending_count"], 1)

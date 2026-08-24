@@ -41,7 +41,10 @@ export class AppComponent implements OnInit, OnDestroy {
 
   constructor() {
     let anyWindow = window as any
-    anyWindow.pdfWorkerSrc = 'assets/js/pdf.worker.min.mjs'
+    anyWindow.pdfWorkerSrc = new URL(
+      'assets/js/pdf.worker.min.mjs',
+      document.baseURI
+    ).toString()
     this.settings.updateAppearanceSettings()
   }
 
@@ -219,7 +222,7 @@ export class AppComponent implements OnInit, OnDestroy {
       },
       {
         anchorId: 'tour.file-tasks',
-        content: $localize`File Tasks shows you documents that have been consumed, are waiting to be, or may have failed during the process.`,
+        content: $localize`Tasks helps you track background work, what needs attention, and what recently completed.`,
         route: '/tasks',
         backdropConfig: {
           offset: 0,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from typing import TYPE_CHECKING
 from unittest import TestCase
 from unittest import mock
@@ -10,6 +11,7 @@ from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import FieldError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -18,6 +20,7 @@ from documents.filters import EffectiveContentFilter
 from documents.filters import TitleContentFilter
 from documents.models import Document
 from documents.tests.utils import DirectoriesMixin
+from documents.tests.utils import read_streaming_response
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -109,7 +112,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             mime_type="application/pdf",
         )
 
-        with mock.patch("documents.index.remove_document_from_index"):
+        with mock.patch("documents.search.get_backend"):
             resp = self.client.delete(f"/api/documents/{root.id}/versions/{root.id}/")
 
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
@@ -136,11 +139,10 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             root_document=root,
             content="v2-content",
         )
+        original_modified = timezone.now() - datetime.timedelta(days=1)
+        Document.objects.filter(pk=root.pk).update(modified=original_modified)
 
-        with (
-            mock.patch("documents.index.remove_document_from_index"),
-            mock.patch("documents.index.add_or_update_document"),
-        ):
+        with mock.patch("documents.search.get_backend"):
             resp = self.client.delete(f"/api/documents/{root.id}/versions/{v2.id}/")
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
@@ -148,11 +150,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.data["current_version_id"], v1.id)
         root.refresh_from_db()
         self.assertEqual(root.content, "root-content")
+        self.assertGreater(root.modified, original_modified)
 
-        with (
-            mock.patch("documents.index.remove_document_from_index"),
-            mock.patch("documents.index.add_or_update_document"),
-        ):
+        with mock.patch("documents.search.get_backend"):
             resp = self.client.delete(f"/api/documents/{root.id}/versions/{v1.id}/")
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
@@ -175,10 +175,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         )
         version_id = version.id
 
-        with (
-            mock.patch("documents.index.remove_document_from_index"),
-            mock.patch("documents.index.add_or_update_document"),
-        ):
+        with mock.patch("documents.search.get_backend"):
             resp = self.client.delete(
                 f"/api/documents/{root.id}/versions/{version_id}/",
             )
@@ -225,7 +222,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             root_document=other_root,
         )
 
-        with mock.patch("documents.index.remove_document_from_index"):
+        with mock.patch("documents.search.get_backend"):
             resp = self.client.delete(
                 f"/api/documents/{root.id}/versions/{other_version.id}/",
             )
@@ -245,10 +242,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             root_document=root,
         )
 
-        with (
-            mock.patch("documents.index.remove_document_from_index"),
-            mock.patch("documents.index.add_or_update_document"),
-        ):
+        with mock.patch("documents.search.get_backend"):
             resp = self.client.delete(
                 f"/api/documents/{version.id}/versions/{version.id}/",
             )
@@ -275,18 +269,17 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             root_document=root,
         )
 
-        with (
-            mock.patch("documents.index.remove_document_from_index") as remove_index,
-            mock.patch("documents.index.add_or_update_document") as add_or_update,
-        ):
+        with mock.patch("documents.search.get_backend") as mock_get_backend:
+            mock_backend = mock.MagicMock()
+            mock_get_backend.return_value = mock_backend
             resp = self.client.delete(
                 f"/api/documents/{root.id}/versions/{version.id}/",
             )
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        remove_index.assert_called_once_with(version)
-        add_or_update.assert_called_once()
-        self.assertEqual(add_or_update.call_args[0][0].id, root.id)
+        mock_backend.remove.assert_called_once_with(version.pk)
+        mock_backend.add_or_update.assert_called_once()
+        self.assertEqual(mock_backend.add_or_update.call_args[0][0].id, root.id)
 
     def test_delete_version_returns_403_without_permission(self) -> None:
         owner = User.objects.create_user(username="owner")
@@ -338,6 +331,8 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             root_document=root,
             version_label="old",
         )
+        original_modified = timezone.now() - datetime.timedelta(days=1)
+        Document.objects.filter(pk=root.pk).update(modified=original_modified)
 
         resp = self.client.patch(
             f"/api/documents/{root.id}/versions/{version.id}/",
@@ -351,6 +346,8 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.data["version_label"], "Label 1")
         self.assertEqual(resp.data["id"], version.id)
         self.assertFalse(resp.data["is_root"])
+        root.refresh_from_db()
+        self.assertGreater(root.modified, original_modified)
 
     def test_update_version_label_clears_on_blank(self) -> None:
         root = Document.objects.create(
@@ -462,19 +459,53 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             f"/api/documents/{root.id}/download/?version={version.id}",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.content, b"version")
+        self.assertEqual(read_streaming_response(resp), b"version")
 
         resp = self.client.get(
             f"/api/documents/{root.id}/preview/?version={version.id}",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.content, b"version")
+        self.assertEqual(read_streaming_response(resp), b"version")
 
         resp = self.client.get(
             f"/api/documents/{root.id}/thumb/?version={version.id}",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.content, b"thumb")
+        self.assertEqual(read_streaming_response(resp), b"thumb")
+
+    def test_thumb_etag_changes_when_latest_version_is_deleted(self) -> None:
+        root = self._create_pdf(title="root", checksum="root")
+        v1 = self._create_pdf(
+            title="v1",
+            checksum="v1",
+            root_document=root,
+        )
+        v2 = self._create_pdf(
+            title="v2",
+            checksum="v2",
+            root_document=root,
+        )
+        self._write_file(v1.thumbnail_path, b"thumb-v1")
+        self._write_file(v2.thumbnail_path, b"thumb-v2")
+
+        resp = self.client.get(f"/api/documents/{root.id}/thumb/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(resp), b"thumb-v2")
+        self.assertEqual(resp.headers["ETag"], '"v2"')
+
+        with mock.patch("documents.search.get_backend"):
+            delete_resp = self.client.delete(
+                f"/api/documents/{root.id}/versions/{v2.id}/",
+            )
+        self.assertEqual(delete_resp.status_code, status.HTTP_200_OK)
+
+        resp = self.client.get(
+            f"/api/documents/{root.id}/thumb/",
+            HTTP_IF_NONE_MATCH='"v2"',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.headers["ETag"], '"v1"')
+        self.assertEqual(read_streaming_response(resp), b"thumb-v1")
 
     def test_metadata_version_param_uses_version(self) -> None:
         root = Document.objects.create(
@@ -550,7 +581,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         async_task.id = "task-123"
 
         with mock.patch("documents.views.consume_file") as consume_mock:
-            consume_mock.delay.return_value = async_task
+            consume_mock.apply_async.return_value = async_task
             resp = self.client.post(
                 f"/api/documents/{root.id}/update_version/",
                 {"document": upload, "version_label": "  New Version  "},
@@ -559,8 +590,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data, "task-123")
-        consume_mock.delay.assert_called_once()
-        input_doc, overrides = consume_mock.delay.call_args[0]
+        consume_mock.apply_async.assert_called_once()
+        task_kwargs = consume_mock.apply_async.call_args.kwargs["kwargs"]
+        input_doc, overrides = task_kwargs["input_doc"], task_kwargs["overrides"]
         self.assertEqual(input_doc.root_document_id, root.id)
         self.assertEqual(input_doc.source, DocumentSource.ApiUpload)
         self.assertEqual(overrides.version_label, "New Version")
@@ -584,7 +616,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         async_task.id = "task-123"
 
         with mock.patch("documents.views.consume_file") as consume_mock:
-            consume_mock.delay.return_value = async_task
+            consume_mock.apply_async.return_value = async_task
             resp = self.client.post(
                 f"/api/documents/{version.id}/update_version/",
                 {"document": upload, "version_label": "  New Version  "},
@@ -593,8 +625,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data, "task-123")
-        consume_mock.delay.assert_called_once()
-        input_doc, overrides = consume_mock.delay.call_args[0]
+        consume_mock.apply_async.assert_called_once()
+        task_kwargs = consume_mock.apply_async.call_args.kwargs["kwargs"]
+        input_doc, overrides = task_kwargs["input_doc"], task_kwargs["overrides"]
         self.assertEqual(input_doc.root_document_id, root.id)
         self.assertEqual(overrides.version_label, "New Version")
         self.assertEqual(overrides.actor_id, self.user.id)
@@ -608,7 +641,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         upload = self._make_pdf_upload()
 
         with mock.patch("documents.views.consume_file") as consume_mock:
-            consume_mock.delay.side_effect = Exception("boom")
+            consume_mock.apply_async.side_effect = Exception("boom")
             resp = self.client.post(
                 f"/api/documents/{root.id}/update_version/",
                 {"document": upload},
@@ -635,6 +668,26 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         )
 
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_update_version_requires_global_change_permission(self) -> None:
+        user = User.objects.create_user(username="add-only")
+        user.user_permissions.add(Permission.objects.get(codename="add_document"))
+        root = Document.objects.create(
+            title="root",
+            checksum="root",
+            mime_type="application/pdf",
+        )
+        self.client.force_authenticate(user=user)
+
+        with mock.patch("documents.views.consume_file") as consume_mock:
+            resp = self.client.post(
+                f"/api/documents/{root.id}/update_version/",
+                {"document": self._make_pdf_upload()},
+                format="multipart",
+            )
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        consume_mock.apply_async.assert_not_called()
 
     def test_update_version_returns_404_for_missing_document(self) -> None:
         resp = self.client.post(
@@ -773,6 +826,67 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data["content"], "v1-content")
+
+    def _make_root_with_out_of_order_versions(self) -> tuple[Document, ...]:
+        """
+        A root whose newest version has a *lower* id than an older one, which is
+        what merging an existing document in as a version produces.
+        """
+        root = Document.objects.create(
+            title="root",
+            checksum="root",
+            mime_type="application/pdf",
+            content="root-content",
+        )
+        newest = Document.objects.create(
+            title="newest",
+            checksum="newest",
+            mime_type="application/pdf",
+            content="newest-content",
+        )
+        older = Document.objects.create(
+            title="older",
+            checksum="older",
+            mime_type="application/pdf",
+            root_document=root,
+            version_index=1,
+            content="older-content",
+        )
+        # Assigned last, so `newest` has the lower id despite being the later version
+        newest.root_document = root
+        newest.version_index = 2
+        newest.save()
+        return root, newest, older
+
+    def test_retrieve_uses_version_index_not_id_for_latest(self) -> None:
+        root, _, _ = self._make_root_with_out_of_order_versions()
+
+        resp = self.client.get(f"/api/documents/{root.id}/")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["content"], "newest-content")
+
+    def test_list_uses_version_index_not_id_for_latest(self) -> None:
+        self._make_root_with_out_of_order_versions()
+
+        resp = self.client.get("/api/documents/?fields=id,content")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [doc["content"] for doc in resp.data["results"]],
+            ["newest-content"],
+        )
+
+    def test_versions_are_listed_newest_first_with_root_last(self) -> None:
+        root, newest, older = self._make_root_with_out_of_order_versions()
+
+        resp = self.client.get(f"/api/documents/{root.id}/")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [(version["id"], version["is_root"]) for version in resp.data["versions"]],
+            [(newest.id, False), (older.id, False), (root.id, True)],
+        )
 
 
 class TestVersionAwareFilters(TestCase):

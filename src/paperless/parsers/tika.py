@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from paperless.parsers import MetadataEntry
+    from paperless.parsers import ParserContext
 
 logger = logging.getLogger("paperless.parsing.tika")
 
@@ -205,6 +206,9 @@ class TikaDocumentParser:
     # Core parsing interface
     # ------------------------------------------------------------------
 
+    def configure(self, context: ParserContext) -> None:
+        pass
+
     def parse(
         self,
         document_path: Path,
@@ -261,9 +265,7 @@ class TikaDocumentParser:
                 f"{settings.TIKA_ENDPOINT}: {err}",
             ) from err
 
-        self._text = parsed.content
-        if self._text is not None:
-            self._text = self._text.strip()
+        self._text = (parsed.content or "").strip()
 
         self._date = parsed.created
         if self._date is not None and timezone.is_naive(self._date):
@@ -277,15 +279,15 @@ class TikaDocumentParser:
     # Result accessors
     # ------------------------------------------------------------------
 
-    def get_text(self) -> str | None:
+    def get_text(self) -> str:
         """Return the plain-text content extracted during parse.
 
         Returns
         -------
-        str | None
-            Extracted text, or None if parse has not been called yet.
+        str
+            Extracted text, or an empty string if no text could be found.
         """
-        return self._text
+        return self._text or ""
 
     def get_date(self) -> datetime.datetime | None:
         """Return the document date detected during parse.
@@ -340,11 +342,19 @@ class TikaDocumentParser:
     ) -> int | None:
         """Return the number of pages in the document.
 
+        Counts pages in the archive PDF produced by a preceding parse()
+        call.  Returns ``None`` if parse() has not been called yet or if
+        no archive was produced.
+
         Returns
         -------
         int | None
-            Always None — page count is not available from Tika.
+            Page count of the archive PDF, or ``None``.
         """
+        if self._archive_path is not None:
+            from paperless.parsers.utils import get_page_count_for_pdf
+
+            return get_page_count_for_pdf(self._archive_path, log=logger)
         return None
 
     def extract_metadata(
@@ -411,6 +421,11 @@ class TikaDocumentParser:
         logger.info("Converting %s to PDF as %s", document_path, pdf_path)
 
         with self._gotenberg_client.libre_office.to_pdf() as route:
+            # Preserve document fields as authored. updateIndexes (Gotenberg's
+            # default) triggers a refresh() that rewrites dynamic fields like
+            # auto-dates to the current date.
+            route.update_indexes(update_indexes=False)
+
             # Set the output format of the resulting PDF.
             # OutputTypeConfig reads the database-stored ApplicationConfiguration
             # first, then falls back to the PAPERLESS_OCR_OUTPUT_TYPE env var.

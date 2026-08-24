@@ -17,6 +17,7 @@ import pytest
 from django.apps import apps
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
+from django.http import StreamingHttpResponse
 from django.test import TransactionTestCase
 from django.test import override_settings
 
@@ -150,6 +151,13 @@ def util_call_with_backoff(
     return succeeded, result
 
 
+def read_streaming_response(response: StreamingHttpResponse) -> bytes:
+    """Consume a StreamingHttpResponse/FileResponse and close it."""
+    content = b"".join(response.streaming_content)
+    response.close()
+    return content
+
+
 class DirectoriesMixin:
     """
     Creates and overrides settings for all folders and paths, then ensures
@@ -157,11 +165,17 @@ class DirectoriesMixin:
     """
 
     def setUp(self) -> None:
+        from documents.search import reset_backend
+
+        reset_backend()
         self.dirs = setup_directories()
         super().setUp()
 
     def tearDown(self) -> None:
+        from documents.search import reset_backend
+
         super().tearDown()
+        reset_backend()
         remove_dirs(self.dirs)
 
 
@@ -170,22 +184,22 @@ class FileSystemAssertsMixin:
     Utilities for checks various state information of the file system
     """
 
-    def assertIsFile(self, path: PathLike | str) -> None:
+    def assertIsFile(self, path: PathLike[str] | str) -> None:
         self.assertTrue(Path(path).resolve().is_file(), f"File does not exist: {path}")
 
-    def assertIsNotFile(self, path: PathLike | str) -> None:
+    def assertIsNotFile(self, path: PathLike[str] | str) -> None:
         self.assertFalse(Path(path).resolve().is_file(), f"File does exist: {path}")
 
-    def assertIsDir(self, path: PathLike | str) -> None:
+    def assertIsDir(self, path: PathLike[str] | str) -> None:
         self.assertTrue(Path(path).resolve().is_dir(), f"Dir does not exist: {path}")
 
-    def assertIsNotDir(self, path: PathLike | str) -> None:
+    def assertIsNotDir(self, path: PathLike[str] | str) -> None:
         self.assertFalse(Path(path).resolve().is_dir(), f"Dir does exist: {path}")
 
     def assertFilesEqual(
         self,
-        path1: PathLike | str,
-        path2: PathLike | str,
+        path1: PathLike[str] | str,
+        path2: PathLike[str] | str,
     ) -> None:
         path1 = Path(path1)
         path2 = Path(path2)
@@ -196,7 +210,7 @@ class FileSystemAssertsMixin:
 
         self.assertEqual(hash1, hash2, "File SHA256 mismatch")
 
-    def assertFileCountInDir(self, path: PathLike | str, count: int) -> None:
+    def assertFileCountInDir(self, path: PathLike[str] | str, count: int) -> None:
         path = Path(path).resolve()
         self.assertTrue(path.is_dir(), f"Path {path} is not a directory")
         files = [x for x in path.iterdir() if x.is_file()]
@@ -225,14 +239,16 @@ class ConsumerProgressMixin:
         self.send_progress_patcher.stop()
 
 
-class DocumentConsumeDelayMixin:
+class ConsumeTaskMixin:
     """
     Provides mocking of the consume_file asynchronous task and useful utilities
     for decoding its arguments
     """
 
     def setUp(self) -> None:
-        self.consume_file_patcher = mock.patch("documents.tasks.consume_file.delay")
+        self.consume_file_patcher = mock.patch(
+            "documents.tasks.consume_file.apply_async",
+        )
         self.consume_file_mock = self.consume_file_patcher.start()
         super().setUp()
 
@@ -240,48 +256,22 @@ class DocumentConsumeDelayMixin:
         super().tearDown()
         self.consume_file_patcher.stop()
 
-    def get_last_consume_delay_call_args(
+    def assert_queue_consumption_task_call_args(
         self,
     ) -> tuple[ConsumableDocument, DocumentMetadataOverrides]:
-        """
-        Returns the most recent arguments to the async task
-        """
-        # Must be at least 1 call
-        self.consume_file_mock.assert_called()
+        """Assert the task was queued exactly once and return its call args."""
+        self.consume_file_mock.assert_called_once()
+        task_kwargs = self.consume_file_mock.call_args.kwargs["kwargs"]
+        return (task_kwargs["input_doc"], task_kwargs["overrides"])
 
-        args, _ = self.consume_file_mock.call_args
-        input_doc, overrides = args
-
-        return (input_doc, overrides)
-
-    def get_all_consume_delay_call_args(
+    def get_all_consume_task_call_args(
         self,
     ) -> Iterator[tuple[ConsumableDocument, DocumentMetadataOverrides]]:
-        """
-        Iterates over all calls to the async task and returns the arguments
-        """
-        # Must be at least 1 call
+        """Iterate over all queued consume task calls and yield their call args."""
         self.consume_file_mock.assert_called()
-
-        for args, kwargs in self.consume_file_mock.call_args_list:
-            input_doc, overrides = args
-
-            yield (input_doc, overrides)
-
-    def get_specific_consume_delay_call_args(
-        self,
-        index: int,
-    ) -> tuple[ConsumableDocument, DocumentMetadataOverrides]:
-        """
-        Returns the arguments of a specific call to the async task
-        """
-        # Must be at least 1 call
-        self.consume_file_mock.assert_called()
-
-        args, _ = self.consume_file_mock.call_args_list[index]
-        input_doc, overrides = args
-
-        return (input_doc, overrides)
+        for call in self.consume_file_mock.call_args_list:
+            task_kwargs = call.kwargs["kwargs"]
+            yield (task_kwargs["input_doc"], task_kwargs["overrides"])
 
 
 class TestMigrations(TransactionTestCase):
@@ -429,7 +419,11 @@ class DummyProgressManager:
         message: str,
         current_progress: int,
         max_progress: int,
-        extra_args: dict[str, str | int] | None = None,
+        *,
+        document_id: int | None = None,
+        owner_id: int | None = None,
+        users_can_view: list[int] | None = None,
+        groups_can_view: list[int] | None = None,
     ) -> None:
         # Ensure the layer is open
         self.open()
@@ -443,9 +437,10 @@ class DummyProgressManager:
                 "max_progress": max_progress,
                 "status": status,
                 "message": message,
+                "document_id": document_id,
+                "owner_id": owner_id,
+                "users_can_view": users_can_view or [],
+                "groups_can_view": groups_can_view or [],
             },
         }
-        if extra_args is not None:
-            payload["data"].update(extra_args)
-
         self.payloads.append(payload)

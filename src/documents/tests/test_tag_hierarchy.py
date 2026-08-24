@@ -11,17 +11,19 @@ from documents.models import WorkflowAction
 from documents.models import WorkflowTrigger
 from documents.serialisers import TagSerializer
 from documents.signals.handlers import run_workflows
+from documents.tests.utils import DirectoriesMixin
 
 
-class TestTagHierarchy(APITestCase):
+class TestTagHierarchy(DirectoriesMixin, APITestCase):
     def setUp(self) -> None:
+        super().setUp()
         self.user = User.objects.create_superuser(username="admin")
         self.client.force_authenticate(user=self.user)
 
         self.parent = Tag.objects.create(name="Parent")
         self.child = Tag.objects.create(name="Child", tn_parent=self.parent)
 
-        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
         self.async_task = patcher.start()
         self.addCleanup(patcher.stop)
 

@@ -388,8 +388,8 @@ describe('DocumentListComponent', () => {
   it('should support select all, none, page & range', () => {
     jest.spyOn(documentListService, 'documents', 'get').mockReturnValue(docs)
     jest
-      .spyOn(documentService, 'listAllFilteredIds')
-      .mockReturnValue(of(docs.map((d) => d.id)))
+      .spyOn(documentListService, 'collectionSize', 'get')
+      .mockReturnValue(docs.length)
     fixture.detectChanges()
     expect(documentListService.selected.size).toEqual(0)
     const docCards = fixture.debugElement.queryAll(
@@ -403,7 +403,8 @@ describe('DocumentListComponent', () => {
     displayModeButtons[2].triggerEventHandler('click')
     expect(selectAllSpy).toHaveBeenCalled()
     fixture.detectChanges()
-    expect(documentListService.selected.size).toEqual(3)
+    expect(documentListService.allSelected).toBeTruthy()
+    expect(documentListService.selectedCount).toEqual(3)
     docCards.forEach((card) => {
       expect(card.context.selected).toBeTruthy()
     })
@@ -729,7 +730,9 @@ describe('DocumentListComponent', () => {
       showInSideBar: true,
     })
     expect(updateVisibilitySpy).not.toHaveBeenCalled()
-    expect(openModal.componentInstance.error).toEqual({ filter_rules: ['11'] })
+    expect(openModal.componentInstance.error()).toEqual({
+      filter_rules: ['11'],
+    })
   })
 
   it('should detect saved view changes', () => {
@@ -776,7 +779,7 @@ describe('DocumentListComponent', () => {
   })
 
   it('should hide columns if no perms or notes disabled', () => {
-    jest.spyOn(permissionService, 'currentUserCan').mockReturnValue(true)
+    permissionService.initialize([], { is_superuser: true } as any)
     jest.spyOn(documentListService, 'documents', 'get').mockReturnValue(docs)
     expect(documentListService.sortField).toEqual('created')
 
@@ -797,7 +800,7 @@ describe('DocumentListComponent', () => {
     ).toHaveLength(9)
 
     // insufficient perms
-    jest.spyOn(permissionService, 'currentUserCan').mockReturnValue(false)
+    permissionService.initialize([], { is_superuser: false } as any)
     fixture.detectChanges()
     expect(
       fixture.debugElement.queryAll(By.directive(SortableDirective))
@@ -836,11 +839,10 @@ describe('DocumentListComponent', () => {
 
   it('should get custom field title', () => {
     fixture.detectChanges()
-    jest
-      .spyOn(settingsService, 'allDisplayFields', 'get')
-      .mockReturnValue([
-        { id: 'custom_field_1' as any, name: 'Custom Field 1' },
-      ])
+    const mockDisplayFields = [
+      { id: 'custom_field_1' as any, name: 'Custom Field 1' },
+    ]
+    settingsService.allDisplayFields = jest.fn(() => mockDisplayFields) as any
     expect(component.getDisplayCustomFieldTitle('custom_field_1')).toEqual(
       'Custom Field 1'
     )

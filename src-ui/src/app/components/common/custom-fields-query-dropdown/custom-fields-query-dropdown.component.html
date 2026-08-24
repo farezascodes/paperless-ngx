@@ -1,6 +1,6 @@
 @if (useDropdown) {
   <div class="btn-group w-100" role="group" ngbDropdown #dropdown="ngbDropdown" (openChange)="onOpenChange($event)" [popperOptions]="popperOptions">
-    <button class="btn btn-sm btn-outline-primary" id="dropdown_toggle" ngbDropdownToggle [disabled]="disabled">
+    <button class="btn btn-sm btn-outline-primary" id="dropdown_toggle" ngbDropdownToggle [disabled]="disabled" [aria-label]="title">
       <i-bs name="{{icon}}"></i-bs><div class="d-none d-sm-inline ms-1">{{title}}</div>
       @if (isActive) {
         <pngx-clearable-badge [selected]="isActive" (cleared)="reset()"></pngx-clearable-badge>
@@ -38,7 +38,7 @@
       ngbDatepicker
       #d="ngbDatepicker"
       [footerTemplate]="datePickerFooterTemplate" />
-    <button class="btn btn-sm btn-outline-secondary rounded-end" (click)="d.toggle()" type="button">
+    <button class="btn btn-sm btn-outline-secondary rounded-end" (click)="d.toggle()" type="button" aria-label="Open date picker" i18n-aria-label>
       <i-bs name="calendar-event"></i-bs>
     </button>
     <ng-template #datePickerFooterTemplate>
@@ -63,10 +63,16 @@
       [(ngModel)]="atom.value"
       [disabled]="disabled"
       [virtualScroll]="getSelectOptionsForField(atom.field)?.length > 100"
+      [searchFn]="selectOptionSearchFn"
       (mousedown)="$event.stopImmediatePropagation()"
     ></ng-select>
   } @else if (getCustomFieldByID(atom.field)?.data_type === CustomFieldDataType.DocumentLink) {
     <pngx-input-document-link [(ngModel)]="atom.value" class="w-25 form-select doc-link-select p-0" placeholder="Search docs..." i18n-placeholder [minimal]="true"></pngx-input-document-link>
+  } @else if (getCustomFieldByID(atom.field)?.data_type === CustomFieldDataType.Monetary) {
+    <input class="w-25 form-control rounded-end" type="text" inputmode="decimal"
+      [ngModel]="atom.value"
+      (ngModelChange)="setMonetaryValue(atom, $event)"
+      [disabled]="disabled">
   } @else {
     <input class="w-25 form-control rounded-end" type="text" [(ngModel)]="atom.value" [disabled]="disabled">
   }
@@ -74,13 +80,14 @@
 
 <ng-template #queryAtom let-atom="atom">
   <div class="input-group input-group-sm">
-    <ng-select
+    <ng-select #fieldSelects
       class="paperless-input-select"
-      [items]="customFields"
+      [items]="customFields()"
       [(ngModel)]="atom.field"
       [disabled]="disabled"
       bindLabel="name"
       bindValue="id"
+      [searchFn]="customFieldSearchFn"
       (mousedown)="$event.stopImmediatePropagation()"
     ></ng-select>
     <select class="w-25 form-select" [(ngModel)]="atom.operator" [disabled]="disabled">
@@ -125,6 +132,7 @@
           [(ngModel)]="atom.value"
           [disabled]="disabled"
           [multiple]="true"
+          [searchFn]="selectOptionSearchFn"
           (mousedown)="$event.stopImmediatePropagation()"
         ></ng-select>
       }
@@ -135,7 +143,7 @@
         <input class="w-25 form-control rounded-end" type="text" [(ngModel)]="atom.value" [disabled]="disabled">
       }
     }
-    <button class="btn btn-link btn-sm text-danger pe-0" type="button" (click)="removeElement(atom)" [disabled]="disabled">
+    <button class="btn btn-link btn-sm text-danger pe-0" type="button" (click)="removeElement(atom)" [disabled]="disabled" aria-label="Remove query" i18n-aria-label>
       <i-bs name="x-circle"></i-bs>
     </button>
   </div>
@@ -177,7 +185,7 @@
         <i-bs name="braces"></i-bs>
       </button>
       @if (expression.depth > 0) {
-        <button type="button" class="btn btn-sm btn-outline-secondary text-danger" (click)="removeElement(expression)" [disabled]="disabled">
+        <button type="button" class="btn btn-sm btn-outline-secondary text-danger" (click)="removeElement(expression)" [disabled]="disabled" aria-label="Remove expression" i18n-aria-label>
           <i-bs name="x-circle"></i-bs>
         </button>
       }

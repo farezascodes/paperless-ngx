@@ -20,6 +20,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from documents.parsers import ParseError
+from paperless.parsers import ParserContext
 from paperless.parsers import ParserProtocol
 from paperless.parsers.remote import RemoteDocumentParser
 
@@ -276,20 +278,20 @@ class TestRemoteParserParse:
     def test_parse_returns_text_from_azure(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
         azure_client: Mock,
     ) -> None:
-        remote_parser.parse(sample_pdf_file, "application/pdf")
+        remote_parser.parse(simple_digital_pdf_file, "application/pdf")
 
         assert remote_parser.get_text() == _DEFAULT_TEXT
 
     def test_parse_sets_archive_path(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
         azure_client: Mock,
     ) -> None:
-        remote_parser.parse(sample_pdf_file, "application/pdf")
+        remote_parser.parse(simple_digital_pdf_file, "application/pdf")
 
         archive = remote_parser.get_archive_path()
         assert archive is not None
@@ -299,10 +301,11 @@ class TestRemoteParserParse:
     def test_parse_closes_client_on_success(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
         azure_client: Mock,
     ) -> None:
-        remote_parser.parse(sample_pdf_file, "application/pdf")
+        remote_parser.configure(ParserContext())
+        remote_parser.parse(simple_digital_pdf_file, "application/pdf")
 
         azure_client.close.assert_called_once()
 
@@ -310,28 +313,139 @@ class TestRemoteParserParse:
     def test_parse_sets_empty_text_when_not_configured(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
     ) -> None:
-        remote_parser.parse(sample_pdf_file, "application/pdf")
+        remote_parser.parse(simple_digital_pdf_file, "application/pdf")
 
         assert remote_parser.get_text() == ""
         assert remote_parser.get_archive_path() is None
 
-    def test_get_text_none_before_parse(
+    def test_get_text_empty_before_parse(
         self,
         remote_parser: RemoteDocumentParser,
     ) -> None:
-        assert remote_parser.get_text() is None
+        assert remote_parser.get_text() == ""
 
     def test_get_date_always_none(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
         azure_client: Mock,
     ) -> None:
-        remote_parser.parse(sample_pdf_file, "application/pdf")
+        remote_parser.parse(simple_digital_pdf_file, "application/pdf")
 
         assert remote_parser.get_date() is None
+
+
+# ---------------------------------------------------------------------------
+# parse() — produce_archive=False skips the remote engine (PDFs only)
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteParserSkipsWhenNoArchiveWanted:
+    """When the caller has already decided no archive is needed for a PDF
+    (documents.consumer.should_produce_archive), the remote engine call is
+    skipped entirely in favor of locally-extracted text.
+    """
+
+    def test_pdf_skips_azure_when_no_archive_requested(
+        self,
+        remote_parser: RemoteDocumentParser,
+        simple_digital_pdf_file: Path,
+        azure_client: Mock,
+    ) -> None:
+        """
+        GIVEN: produce_archive=False for a PDF
+        WHEN:  parse() is called
+        THEN:  Azure is never invoked, no archive is produced, and text
+               comes from local pdftotext extraction
+        """
+        remote_parser.parse(
+            simple_digital_pdf_file,
+            "application/pdf",
+            produce_archive=False,
+        )
+
+        azure_client.begin_analyze_document.assert_not_called()
+        assert remote_parser.get_archive_path() is None
+        assert remote_parser.get_text() != ""
+
+    def test_pdf_no_archive_requested_text_matches_local_extraction(
+        self,
+        remote_parser: RemoteDocumentParser,
+        simple_digital_pdf_file: Path,
+        azure_client: Mock,
+        mocker: MockerFixture,
+    ) -> None:
+        """
+        GIVEN: produce_archive=False for a PDF
+        WHEN:  parse() is called
+        THEN:  the returned text is exactly the locally-extracted text,
+               not anything from the (unused) Azure mock
+        """
+        mocker.patch(
+            "paperless.parsers.remote.extract_pdf_text",
+            return_value="Local digital text.",
+        )
+
+        remote_parser.parse(
+            simple_digital_pdf_file,
+            "application/pdf",
+            produce_archive=False,
+        )
+
+        assert remote_parser.get_text() == "Local digital text."
+
+    def test_pdf_no_archive_requested_closes_no_client(
+        self,
+        remote_parser: RemoteDocumentParser,
+        simple_digital_pdf_file: Path,
+        azure_client: Mock,
+    ) -> None:
+        remote_parser.parse(
+            simple_digital_pdf_file,
+            "application/pdf",
+            produce_archive=False,
+        )
+
+        azure_client.close.assert_not_called()
+
+    def test_non_pdf_still_calls_azure_when_no_archive_requested(
+        self,
+        remote_parser: RemoteDocumentParser,
+        simple_digital_pdf_file: Path,
+        azure_client: Mock,
+    ) -> None:
+        """
+        Images have no local-text fallback, so produce_archive=False does
+        not skip the remote engine for non-PDF MIME types.
+        """
+        remote_parser.parse(
+            simple_digital_pdf_file,
+            "image/png",
+            produce_archive=False,
+        )
+
+        azure_client.begin_analyze_document.assert_called_once()
+        assert remote_parser.get_text() == _DEFAULT_TEXT
+
+    @pytest.mark.usefixtures("no_engine_settings")
+    def test_unconfigured_engine_takes_precedence_over_skip(
+        self,
+        remote_parser: RemoteDocumentParser,
+        simple_digital_pdf_file: Path,
+    ) -> None:
+        """An unconfigured engine still short-circuits before the
+        produce_archive check, returning empty text as before.
+        """
+        remote_parser.parse(
+            simple_digital_pdf_file,
+            "application/pdf",
+            produce_archive=False,
+        )
+
+        assert remote_parser.get_text() == ""
+        assert remote_parser.get_archive_path() is None
 
 
 # ---------------------------------------------------------------------------
@@ -340,39 +454,40 @@ class TestRemoteParserParse:
 
 
 class TestRemoteParserParseError:
-    def test_parse_returns_none_on_azure_error(
+    def test_parse_raises_parse_error_on_azure_error(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
         failing_azure_client: Mock,
     ) -> None:
-        remote_parser.parse(sample_pdf_file, "application/pdf")
-
-        assert remote_parser.get_text() is None
+        with pytest.raises(ParseError, match="Azure AI Vision parsing failed"):
+            remote_parser.parse(simple_digital_pdf_file, "application/pdf")
 
     def test_parse_closes_client_on_error(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
         failing_azure_client: Mock,
     ) -> None:
-        remote_parser.parse(sample_pdf_file, "application/pdf")
+        with pytest.raises(ParseError):
+            remote_parser.parse(simple_digital_pdf_file, "application/pdf")
 
         failing_azure_client.close.assert_called_once()
 
     def test_parse_logs_error_on_azure_failure(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
         failing_azure_client: Mock,
         mocker: MockerFixture,
     ) -> None:
         mock_log = mocker.patch("paperless.parsers.remote.logger")
 
-        remote_parser.parse(sample_pdf_file, "application/pdf")
+        with pytest.raises(ParseError):
+            remote_parser.parse(simple_digital_pdf_file, "application/pdf")
 
-        mock_log.error.assert_called_once()
-        assert "Azure AI Vision parsing failed" in mock_log.error.call_args[0][0]
+        mock_log.exception.assert_called_once()
+        assert "Azure AI Vision parsing failed" in mock_log.exception.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -384,18 +499,18 @@ class TestRemoteParserPageCount:
     def test_page_count_for_pdf(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
     ) -> None:
-        count = remote_parser.get_page_count(sample_pdf_file, "application/pdf")
+        count = remote_parser.get_page_count(simple_digital_pdf_file, "application/pdf")
         assert isinstance(count, int)
         assert count >= 1
 
     def test_page_count_returns_none_for_image_mime(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
     ) -> None:
-        count = remote_parser.get_page_count(sample_pdf_file, "image/png")
+        count = remote_parser.get_page_count(simple_digital_pdf_file, "image/png")
         assert count is None
 
     def test_page_count_returns_none_for_invalid_pdf(
@@ -418,25 +533,31 @@ class TestRemoteParserMetadata:
     def test_extract_metadata_non_pdf_returns_empty(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
     ) -> None:
-        result = remote_parser.extract_metadata(sample_pdf_file, "image/png")
+        result = remote_parser.extract_metadata(simple_digital_pdf_file, "image/png")
         assert result == []
 
     def test_extract_metadata_pdf_returns_list(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
     ) -> None:
-        result = remote_parser.extract_metadata(sample_pdf_file, "application/pdf")
+        result = remote_parser.extract_metadata(
+            simple_digital_pdf_file,
+            "application/pdf",
+        )
         assert isinstance(result, list)
 
     def test_extract_metadata_pdf_entries_have_required_keys(
         self,
         remote_parser: RemoteDocumentParser,
-        sample_pdf_file: Path,
+        simple_digital_pdf_file: Path,
     ) -> None:
-        result = remote_parser.extract_metadata(sample_pdf_file, "application/pdf")
+        result = remote_parser.extract_metadata(
+            simple_digital_pdf_file,
+            "application/pdf",
+        )
         for entry in result:
             assert "namespace" in entry
             assert "prefix" in entry
@@ -479,12 +600,17 @@ class TestRemoteParserRegistry:
         assert parser_cls is RemoteDocumentParser
 
     @pytest.mark.usefixtures("no_engine_settings")
-    def test_get_parser_returns_none_for_pdf_when_not_configured(self) -> None:
-        """With no tesseract parser registered yet, PDF has no handler if remote is off."""
+    def test_get_parser_returns_none_for_unsupported_type_when_not_configured(
+        self,
+    ) -> None:
+        """With remote off and a truly unsupported MIME type, registry returns None."""
         from paperless.parsers.registry import ParserRegistry
 
         registry = ParserRegistry()
         registry.register_defaults()
-        parser_cls = registry.get_parser_for_file("application/pdf", "doc.pdf")
+        parser_cls = registry.get_parser_for_file(
+            "application/x-unknown-format",
+            "doc.xyz",
+        )
 
         assert parser_cls is None

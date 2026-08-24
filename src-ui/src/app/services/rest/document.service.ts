@@ -12,7 +12,7 @@ import {
 import { DocumentMetadata } from 'src/app/data/document-metadata'
 import { DocumentSuggestions } from 'src/app/data/document-suggestions'
 import { FilterRule } from 'src/app/data/filter-rule'
-import { Results } from 'src/app/data/results'
+import { Results, SelectionData } from 'src/app/data/results'
 import { SETTINGS_KEYS } from 'src/app/data/ui-settings'
 import { queryParamsFromFilterRules } from '../../utils/query-params'
 import {
@@ -23,19 +23,6 @@ import {
 import { SettingsService } from '../settings.service'
 import { AbstractPaperlessService } from './abstract-paperless-service'
 import { CustomFieldsService } from './custom-fields.service'
-
-export interface SelectionDataItem {
-  id: number
-  document_count: number
-}
-
-export interface SelectionData {
-  selected_storage_paths: SelectionDataItem[]
-  selected_correspondents: SelectionDataItem[]
-  selected_tags: SelectionDataItem[]
-  selected_document_types: SelectionDataItem[]
-  selected_custom_fields: SelectionDataItem[]
-}
 
 export enum BulkEditSourceMode {
   LATEST_VERSION = 'latest_version',
@@ -79,6 +66,12 @@ export interface RemovePasswordDocumentsRequest {
   delete_original?: boolean
   include_metadata?: boolean
   source_mode?: BulkEditSourceMode
+}
+
+export interface DocumentSelectionQuery {
+  documents?: number[]
+  all?: boolean
+  filters?: { [key: string]: any }
 }
 
 @Injectable({
@@ -338,33 +331,37 @@ export class DocumentService extends AbstractPaperlessService<Document> {
     return this.http.get<DocumentMetadata>(url.toString())
   }
 
-  bulkEdit(ids: number[], method: DocumentBulkEditMethod, args: any) {
+  bulkEdit(
+    selection: DocumentSelectionQuery,
+    method: DocumentBulkEditMethod,
+    args: any
+  ) {
     return this.http.post(this.getResourceUrl(null, 'bulk_edit'), {
-      documents: ids,
+      ...selection,
       method: method,
       parameters: args,
     })
   }
 
-  deleteDocuments(ids: number[]) {
+  deleteDocuments(selection: DocumentSelectionQuery) {
     return this.http.post(this.getResourceUrl(null, 'delete'), {
-      documents: ids,
+      ...selection,
     })
   }
 
-  reprocessDocuments(ids: number[]) {
+  reprocessDocuments(selection: DocumentSelectionQuery) {
     return this.http.post(this.getResourceUrl(null, 'reprocess'), {
-      documents: ids,
+      ...selection,
     })
   }
 
   rotateDocuments(
-    ids: number[],
+    selection: DocumentSelectionQuery,
     degrees: number,
     sourceMode: BulkEditSourceMode = BulkEditSourceMode.LATEST_VERSION
   ) {
     return this.http.post(this.getResourceUrl(null, 'rotate'), {
-      documents: ids,
+      ...selection,
       degrees,
       source_mode: sourceMode,
     })
@@ -374,6 +371,18 @@ export class DocumentService extends AbstractPaperlessService<Document> {
     return this.http.post(this.getResourceUrl(null, 'merge'), {
       documents: ids,
       ...request,
+    })
+  }
+
+  mergeDocumentsAsVersions(
+    ids: number[],
+    rootDocumentId: number,
+    versionLabel?: string
+  ) {
+    return this.http.post(this.getResourceUrl(null, 'merge_as_versions'), {
+      documents: ids,
+      root_document_id: rootDocumentId,
+      ...(versionLabel ? { version_label: versionLabel } : {}),
     })
   }
 
@@ -407,19 +416,25 @@ export class DocumentService extends AbstractPaperlessService<Document> {
     )
   }
 
+  getAiSuggestions(id: number): Observable<DocumentSuggestions> {
+    return this.http.get<DocumentSuggestions>(
+      this.getResourceUrl(id, 'ai_suggestions')
+    )
+  }
+
   getHistory(id: number): Observable<AuditLogEntry[]> {
     return this.http.get<AuditLogEntry[]>(this.getResourceUrl(id, 'history'))
   }
 
   bulkDownload(
-    ids: number[],
+    selection: DocumentSelectionQuery,
     content = 'both',
     useFilenameFormatting: boolean = false
   ) {
     return this.http.post(
       this.getResourceUrl(null, 'bulk_download'),
       {
-        documents: ids,
+        ...selection,
         content: content,
         follow_formatting: useFilenameFormatting,
       },

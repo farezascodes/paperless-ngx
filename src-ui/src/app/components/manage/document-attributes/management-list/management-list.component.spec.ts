@@ -5,12 +5,7 @@ import {
   withInterceptorsFromDi,
 } from '@angular/common/http'
 import { provideHttpClientTesting } from '@angular/common/http/testing'
-import {
-  ComponentFixture,
-  TestBed,
-  fakeAsync,
-  tick,
-} from '@angular/core/testing'
+import { ComponentFixture, TestBed } from '@angular/core/testing'
 import { FormsModule, ReactiveFormsModule } from '@angular/forms'
 import { By } from '@angular/platform-browser'
 import { RouterLinkWithHref } from '@angular/router'
@@ -117,7 +112,6 @@ describe('ManagementListComponent', () => {
             : tags
           return of({
             count: results.length,
-            all: results.map((o) => o.id),
             results,
           })
         }
@@ -141,24 +135,26 @@ describe('ManagementListComponent', () => {
 
   // These tests are shared among all management list components
 
-  it('should support filtering, clear on Esc key', fakeAsync(() => {
+  it('should support filtering, clear on Esc key', () => {
+    jest.useFakeTimers()
     const nameFilterInput = fixture.debugElement.query(By.css('input'))
     nameFilterInput.nativeElement.value = 'foo'
     // nameFilterInput.nativeElement.dispatchEvent(new Event('input'))
     component.nameFilter = 'foo' // subject normally triggered by ngModel
-    tick(400) // debounce
+    jest.advanceTimersByTime(400) // debounce
     fixture.detectChanges()
-    expect(component.data).toEqual([tags[0]])
+    expect(component.data()).toEqual([tags[0]])
 
     nameFilterInput.nativeElement.dispatchEvent(
       new KeyboardEvent('keyup', { code: 'Escape' })
     )
-    tick(400) // debounce
+    jest.advanceTimersByTime(400) // debounce
     fixture.detectChanges()
     expect(component.nameFilter).toBeNull()
-    expect(component.data).toEqual(tags)
-    tick(100) // load
-  }))
+    expect(component.data()).toEqual(tags)
+    jest.advanceTimersByTime(100) // load
+    jest.useRealTimers()
+  })
 
   it('should support create, show notification on error / success', () => {
     let modal: NgbModalRef
@@ -231,21 +227,23 @@ describe('ManagementListComponent', () => {
     expect(reloadSpy).toHaveBeenCalled()
   })
 
-  it('should use API count for pagination and all ids for displayed total', fakeAsync(() => {
+  it('should use API count for pagination and nested ids for displayed total', () => {
+    jest.useFakeTimers()
     jest.spyOn(tagService, 'listFiltered').mockReturnValueOnce(
       of({
         count: 1,
-        all: [1, 2, 3],
+        display_count: 3,
         results: tags.slice(0, 1),
       })
     )
 
     component.reloadData()
-    tick(100)
+    jest.advanceTimersByTime(100)
 
-    expect(component.collectionSize).toBe(1)
-    expect(component.displayCollectionSize).toBe(3)
-  }))
+    expect(component.collectionSize()).toBe(1)
+    expect(component.displayCollectionSize()).toBe(3)
+    jest.useRealTimers()
+  })
 
   it('should support quick filter for objects', () => {
     const expectedUrl = documentListViewService.getQuickFilterUrl([
@@ -276,9 +274,9 @@ describe('ManagementListComponent', () => {
           })
       )
     )
-    component.page = 2
+    component.page.set(2)
     component.reloadData()
-    expect(component.page).toEqual(1)
+    expect(component.page()).toEqual(1)
   })
 
   it('should support toggle select page in vew', () => {
@@ -296,67 +294,71 @@ describe('ManagementListComponent', () => {
 
   it('selectNone should clear selection and reset toggle flag', () => {
     component.selectedObjects = new Set([tags[0].id, tags[1].id])
-    component.togggleAll = true
+    component.togggleAll.set(true)
 
     component.selectNone()
 
     expect(component.selectedObjects.size).toBe(0)
-    expect(component.togggleAll).toBe(false)
+    expect(component.togggleAll()).toBe(false)
   })
 
   it('selectPage should select current page items or clear selection', () => {
     component.selectPage()
     expect(component.selectedObjects).toEqual(new Set(tags.map((t) => t.id)))
-    expect(component.togggleAll).toBe(true)
+    expect(component.togggleAll()).toBe(true)
 
-    component.togggleAll = true
+    component.togggleAll.set(true)
     component.clearSelection()
     expect(component.selectedObjects.size).toBe(0)
-    expect(component.togggleAll).toBe(false)
+    expect(component.togggleAll()).toBe(false)
   })
 
-  it('selectAll should use all IDs when collection size exists', () => {
-    ;(component as any).allIDs = [1, 2, 3, 4]
-    component.collectionSize = 4
+  it('selectAll should activate all-selection mode', () => {
+    ;(tagService.listFiltered as jest.Mock).mockClear()
+    component.collectionSize.set(tags.length)
 
     component.selectAll()
 
-    expect(component.selectedObjects).toEqual(new Set([1, 2, 3, 4]))
-    expect(component.togggleAll).toBe(true)
+    expect(tagService.listFiltered).not.toHaveBeenCalled()
+    expect(component.selectedObjects).toEqual(new Set(tags.map((t) => t.id)))
+    expect((component as any).allSelectionActive).toBe(true)
+    expect(component.hasSelection).toBe(true)
+    expect(component.selectedCount).toBe(tags.length)
+    expect(component.togggleAll()).toBe(true)
   })
 
   it('selectAll should clear selection when collection size is zero', () => {
     component.selectedObjects = new Set([1])
-    component.collectionSize = 0
-    component.togggleAll = true
+    component.collectionSize.set(0)
+    component.togggleAll.set(true)
 
     component.selectAll()
 
     expect(component.selectedObjects.size).toBe(0)
-    expect(component.togggleAll).toBe(false)
+    expect(component.togggleAll()).toBe(false)
   })
 
   it('toggleSelected should toggle object selection and update toggle state', () => {
     component.toggleSelected(tags[0])
     expect(component.selectedObjects.has(tags[0].id)).toBe(true)
-    expect(component.togggleAll).toBe(false)
+    expect(component.togggleAll()).toBe(false)
 
     component.toggleSelected(tags[1])
     component.toggleSelected(tags[2])
-    expect(component.togggleAll).toBe(true)
+    expect(component.togggleAll()).toBe(true)
 
     component.toggleSelected(tags[1])
     expect(component.selectedObjects.has(tags[1].id)).toBe(false)
-    expect(component.togggleAll).toBe(false)
+    expect(component.togggleAll()).toBe(false)
   })
 
   it('areAllPageItemsSelected should return false when page has no selectable items', () => {
-    component.data = []
+    component.data.set([])
     component.selectedObjects.clear()
 
     expect((component as any).areAllPageItemsSelected()).toBe(false)
 
-    component.data = tags
+    component.data.set(tags)
   })
 
   it('should support bulk edit permissions', () => {
@@ -395,6 +397,33 @@ describe('ManagementListComponent', () => {
     expect(successToastSpy).toHaveBeenCalled()
   })
 
+  it('should support bulk edit permissions for all filtered items', () => {
+    const bulkEditPermsSpy = jest
+      .spyOn(tagService, 'bulk_edit_objects')
+      .mockReturnValue(of('OK'))
+    component.selectAll()
+
+    let modal: NgbModalRef
+    modalService.activeInstances.subscribe((m) => (modal = m[m.length - 1]))
+    fixture.detectChanges()
+    component.setPermissions()
+    expect(modal).not.toBeUndefined()
+
+    modal.componentInstance.confirmClicked.emit({
+      permissions: {},
+      merge: true,
+    })
+
+    expect(bulkEditPermsSpy).toHaveBeenCalledWith(
+      [],
+      BulkEditObjectOperation.SetPermissions,
+      {},
+      true,
+      true,
+      { is_root: true }
+    )
+  })
+
   it('should support bulk delete objects', () => {
     const bulkEditSpy = jest.spyOn(tagService, 'bulk_edit_objects')
     component.toggleSelected(tags[0])
@@ -415,7 +444,11 @@ describe('ManagementListComponent', () => {
     modal.componentInstance.confirmClicked.emit(null)
     expect(bulkEditSpy).toHaveBeenCalledWith(
       Array.from(selected),
-      BulkEditObjectOperation.Delete
+      BulkEditObjectOperation.Delete,
+      null,
+      null,
+      false,
+      null
     )
     expect(errorToastSpy).toHaveBeenCalled()
 
@@ -424,6 +457,29 @@ describe('ManagementListComponent', () => {
     modal.componentInstance.confirmClicked.emit(null)
     expect(bulkEditSpy).toHaveBeenCalled()
     expect(successToastSpy).toHaveBeenCalled()
+  })
+
+  it('should support bulk delete for all filtered items', () => {
+    const bulkEditSpy = jest
+      .spyOn(tagService, 'bulk_edit_objects')
+      .mockReturnValue(of('OK'))
+
+    component.selectAll()
+    let modal: NgbModalRef
+    modalService.activeInstances.subscribe((m) => (modal = m[m.length - 1]))
+    fixture.detectChanges()
+    component.delete()
+    expect(modal).not.toBeUndefined()
+
+    modal.componentInstance.confirmClicked.emit(null)
+    expect(bulkEditSpy).toHaveBeenCalledWith(
+      [],
+      BulkEditObjectOperation.Delete,
+      null,
+      null,
+      true,
+      { is_root: true }
+    )
   })
 
   it('should disallow bulk permissions or delete objects if no global perms', () => {
@@ -441,7 +497,7 @@ describe('ManagementListComponent', () => {
       document_count: 10,
       parent: 1,
     }
-    component['unfilteredData'].push(childTag)
+    component['unfilteredData'].update((data) => [...data, childTag])
     const original = component.getOriginalObject({ id: 4 } as Tag)
     expect(original).toEqual(childTag)
   })
@@ -468,7 +524,7 @@ describe('ManagementListComponent', () => {
     expect(component.pageSize).toBe(25)
   })
 
-  it('pageSize setter should update settings, reset page and reload data on success', fakeAsync(() => {
+  it('pageSize setter should update settings, reset page and reload data on success', () => {
     const reloadSpy = jest.spyOn(component, 'reloadData')
     const toastErrorSpy = jest.spyOn(toastService, 'showError')
 
@@ -479,21 +535,19 @@ describe('ManagementListComponent', () => {
       .mockReturnValue(of({ success: true }))
 
     component.typeNamePlural = 'tags'
-    component.page = 2
+    component.page.set(2)
     component.pageSize = 100
-
-    tick()
 
     expect(settingsService.set).toHaveBeenCalledWith(
       SETTINGS_KEYS.OBJECT_LIST_SIZES,
       { tags: 100 }
     )
-    expect(component.page).toBe(1)
+    expect(component.page()).toBe(1)
     expect(reloadSpy).toHaveBeenCalled()
     expect(toastErrorSpy).not.toHaveBeenCalled()
-  }))
+  })
 
-  it('pageSize setter should show error toast on settings store failure', fakeAsync(() => {
+  it('pageSize setter should show error toast on settings store failure', () => {
     const reloadSpy = jest.spyOn(component, 'reloadData')
     const toastErrorSpy = jest.spyOn(toastService, 'showError')
 
@@ -506,12 +560,10 @@ describe('ManagementListComponent', () => {
     component.typeNamePlural = 'tags'
     component.pageSize = 50
 
-    tick()
-
     expect(toastErrorSpy).toHaveBeenCalledWith(
       'Error saving settings',
       expect.any(Error)
     )
     expect(reloadSpy).not.toHaveBeenCalled()
-  }))
+  })
 })
