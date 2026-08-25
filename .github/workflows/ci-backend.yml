@@ -120,6 +120,7 @@ jobs:
         run: |
           uv sync \
             --python "${PYTHON_VERSION}" \
+            --extra s3 \
             --group testing \
             --frozen
       - name: List installed Python dependencies
@@ -189,6 +190,7 @@ jobs:
         run: |
           uv sync \
             --python "${PYTHON_VERSION}" \
+            --extra s3 \
             --group testing \
             --group typing \
             --frozen

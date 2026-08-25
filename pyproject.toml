@@ -89,6 +89,13 @@ postgres = [
   "psycopg-c==3.3.4",
   "psycopg-pool==3.3.1",
 ]
+s3 = [
+  # Lower bounds, not compatible-release pins: botocore publishes minor
+  # releases near-daily and boto3 pins it tightly, so a "~=" pin here would
+  # churn the lockfile constantly for a feature most installs never enable.
+  "boto3>=1.42.73",
+  "django-storages[s3]>=1.14.6",
+]
 webserver = [
   "granian[uvloop]~=2.7.0",
 ]
@@ -111,6 +118,7 @@ testing = [
   "factory-boy~=3.3.1",
   "faker~=40.36.0",
   "imagehash",
+  "moto[s3]~=5.1.0",
   "pytest~=9.1.1",
   "pytest-cov~=7.1.0",
   "pytest-django~=4.12.0",
