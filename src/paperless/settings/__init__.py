@@ -247,7 +247,124 @@ STORAGES = {
         "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage",
     },
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    # Document media: originals, archive files and thumbnails.
+    #
+    # Local filesystem unless object storage is explicitly enabled below. Note
+    # that "default" and "staticfiles" are never touched by that switch, so
+    # enabling object storage cannot change how the app logo is stored or
+    # break whitenoise's compressed static files.
+    #
+    # Always resolve this lazily, via
+    # django.core.files.storage.storages["documents"]. Capturing it at import
+    # time puts it out of reach of override_settings() in tests.
+    "documents": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+        "OPTIONS": {
+            "location": str(MEDIA_ROOT),
+            "allow_overwrite": True,
+        },
+    },
 }
+
+###############################################################################
+# Object storage (S3-compatible)                                              #
+###############################################################################
+
+# Opt-in. When off, nothing here is evaluated, the "documents" alias stays on
+# the local filesystem and neither boto3 nor django-storages is imported --
+# which is what lets the s3 extra stay optional.
+OBJ_STORAGE_ENABLED: Final[bool] = get_bool_from_env(
+    "PAPERLESS_OBJ_STORAGE_ENABLED",
+)
+
+if OBJ_STORAGE_ENABLED:
+    from botocore.config import Config
+
+    _OBJ_STORAGE_BUCKET = os.getenv("PAPERLESS_OBJ_STORAGE_BUCKET")
+    if not _OBJ_STORAGE_BUCKET:
+        raise ImproperlyConfigured(
+            "PAPERLESS_OBJ_STORAGE_ENABLED is set, but "
+            "PAPERLESS_OBJ_STORAGE_BUCKET is not configured.",
+        )
+
+    STORAGES["documents"] = {
+        "BACKEND": "documents.storages.S3DocumentStorage",
+        "OPTIONS": {
+            "bucket_name": _OBJ_STORAGE_BUCKET,
+            # Leave unset for AWS itself; set it for MinIO or any other
+            # S3-compatible gateway.
+            "endpoint_url": os.getenv("PAPERLESS_OBJ_STORAGE_ENDPOINT_URL") or None,
+            # Omit both to fall back to the ambient credential chain
+            # (instance profile, IRSA, ~/.aws, environment).
+            "access_key": os.getenv("PAPERLESS_OBJ_STORAGE_ACCESS_KEY") or None,
+            "secret_key": os.getenv("PAPERLESS_OBJ_STORAGE_SECRET_KEY") or None,
+            "region_name": os.getenv(
+                "PAPERLESS_OBJ_STORAGE_REGION",
+                "us-east-1",
+            ),
+            # Key prefix within the bucket. Empty by default so keys mirror the
+            # on-disk layout exactly (documents/originals/..., and so on) --
+            # that is what makes migrating an existing install a pure object
+            # copy with no database writes.
+            "location": os.getenv("PAPERLESS_OBJ_STORAGE_PREFIX", ""),
+            # Overwriting is a correctness requirement, not a preference.
+            # Re-OCR and thumbnail regeneration rewrite keys that already
+            # exist; with this off, Storage.save() appends a random suffix and
+            # silently orphans the object the database still points at.
+            "file_overwrite": True,
+            # Buckets are private. Object ACLs are deliberately not set: many
+            # S3-compatible gateways reject them outright.
+            "default_acl": None,
+            # Path to a CA bundle for a gateway using a private CA. Note that
+            # botocore ignores REQUESTS_CA_BUNDLE -- this is the setting that
+            # actually takes effect.
+            "verify": os.getenv("PAPERLESS_OBJ_STORAGE_CA_BUNDLE") or None,
+            "client_config": Config(
+                # Hard-set, not operator-tunable. Left unset, botocore
+                # registers _default_s3_presign_to_sigv2 for S3 and presigned
+                # URLs silently come out SigV2.
+                signature_version="s3v4",
+                s3={
+                    # MinIO and most self-hosted gateways serve a bare endpoint
+                    # and need path-style addressing.
+                    "addressing_style": get_choice_from_env(
+                        "PAPERLESS_OBJ_STORAGE_ADDRESSING_STYLE",
+                        {"path", "virtual", "auto"},
+                        "path",
+                    ),
+                },
+                retries={
+                    "mode": "standard",
+                    "total_max_attempts": get_int_from_env(
+                        "PAPERLESS_OBJ_STORAGE_MAX_ATTEMPTS",
+                        3,
+                    ),
+                },
+                connect_timeout=get_int_from_env(
+                    "PAPERLESS_OBJ_STORAGE_CONNECT_TIMEOUT",
+                    5,
+                ),
+                read_timeout=get_int_from_env(
+                    "PAPERLESS_OBJ_STORAGE_READ_TIMEOUT",
+                    60,
+                ),
+                # Should be at least the worker concurrency, or requests will
+                # queue behind the connection pool under parallel consumption.
+                max_pool_connections=get_int_from_env(
+                    "PAPERLESS_OBJ_STORAGE_MAX_POOL_CONNECTIONS",
+                    10,
+                ),
+                # Escape hatch: boto3 >= 1.36 sends CRC32 trailers by default
+                # and some gateways reject them. Set to "when_required" if
+                # uploads fail with a checksum or trailer error.
+                request_checksum_calculation=get_choice_from_env(
+                    "PAPERLESS_OBJ_STORAGE_CHECKSUM_CALCULATION",
+                    {"when_supported", "when_required"},
+                    "when_supported",
+                ),
+            ),
+        },
+    }
 
 _CELERY_REDIS_URL, _CHANNELS_REDIS_URL = parse_redis_url(
     os.getenv("PAPERLESS_REDIS", None),
